@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<title>AudioMass - AI Controllable Editor</title>
+	<link href="../src/ico.png" rel="shortcut icon">
+	<meta charset="utf-8" />
+
+	<meta http-equiv="X-UA-Compatible" content="IE=edge" />
+	<meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=1, user-scalable=no">
+
+	<meta name="description" content="AudioMass is a free full-featured web-based audio &amp; waveform editing tool"/>
+	<meta name="mobile-web-app-capable" content="yes">
+	<meta name="apple-mobile-web-app-title" content="AudioMass">
+	<meta name="apple-mobile-web-app-capable" content="yes">
+	<meta name="apple-mobile-web-app-status-bar-style" content="black">
+
+	<link rel="stylesheet" type="text/css" href="../src/main.css">
+</head>
+<body>
+	<div id="app"></div>
+
+	<!-- Mirrors src/index.html script load order, referenced via ../src so upstream stays pristine. -->
+	<script src="../src/dist/wavesurfer.js"></script>
+	<script src="../src/dist/plugin/wavesurfer.regions.js"></script>
+	<script src="../src/oneup.js"></script>
+
+	<script src="../src/app.js"></script>
+	<script src="../src/keys.js"></script>
+	<script src="../src/markers.js"></script>
+	<script src="../src/contextmenu.js"></script>
+	<script src="../src/lufs.js"></script>
+	<script src="../src/ui-fx.js"></script>
+	<script src="../src/ui.js"></script>
+	<script src="../src/modal.js"></script>
+	<script src="../src/state.js"></script>
+	<script src="../src/engine.js"></script>
+	<script src="../src/actions.js"></script>
+	<script src="../src/drag.js"></script>
+	<script src="../src/recorder.js"></script>
+
+	<script src="../src/welcome.js"></script>
+	<script src="../src/fx-pg-eq.js"></script>
+	<script src="../src/fx-auto.js"></script>
+	<script src="../src/local.js"></script>
+	<script src="../src/id3.js"></script>
+	<script src="../src/lzma.js"></script>
+	<script src="../src/amss-format.js"></script>
+	<script src="../src/multitrack.js"></script>
+	<script>
+		var editor = PKAudioEditor.init ('app');
+	</script>
+
+	<!-- AI control client: polls for PKAudioEditor, dials the bridge, executes verbs. -->
+	<script src="control.js"></script>
+</body>
+</html>
