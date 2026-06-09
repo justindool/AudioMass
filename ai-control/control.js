@@ -1900,6 +1900,81 @@
 			}
 		},
 
+		layOutShow: {
+			help: 'Lay out a WHOLE show in ONE call from a declarative layout, with per-clip fades and optional ducking — the high-level "build my show" verb. Args: {layout:{tracks:[{name, clips:[{url, at?, fadeIn?, fadeOut?}]}]}, duck?:{voiceTrack, musicTrack, underDb?}} (duck track names refer to layout.tracks[].name). Composes layInShow (build EXACTLY these tracks+clips at their positions, no orphans) + fadeClip (each clip\'s fadeIn/fadeOut) + duckMusicUnderVoice. Multitrack. Returns the final getBoard snapshot plus {clipsAdded, fadesApplied, ducked, warnings}. Async. (For ad-hoc edits, the primitives compose directly via batch; this is the one-call convenience for a full show.)',
+			run: function ( args ) {
+				args = args || {};
+				var layout = args.layout;
+				if (!layout || typeof layout !== 'object' || !Array.isArray (layout.tracks) || !layout.tracks.length)
+					throw new Error ('layOutShow requires args.layout = {tracks:[{name, clips:[{url, at?, fadeIn?, fadeOut?}]}]}');
+				var duck = (args.duck && typeof args.duck === 'object') ? args.duck : null;
+				var warnings = [];
+				var fadesApplied = 0;
+				var clipsAdded = 0;
+
+				// Build the board first (positions only); layInShow validates urls + avoids orphans.
+				var bare = { tracks: layout.tracks.map (function ( t ) {
+					return { name: t.name, clips: (t.clips || []).map (function ( c ) { return { url: c.url, at: c.at }; }) };
+				}) };
+
+				var p = callVerb ('layInShow', { layout: bare }).then (function ( res ) {
+					if (res) {
+						if (typeof res.clipsAdded === 'number') clipsAdded = res.clipsAdded;
+						if (Array.isArray (res.warnings)) warnings = warnings.concat (res.warnings);
+					}
+					// Map resulting board clips (by track name + clip order) and apply fades.
+					var snap = projectSnapshot ();
+					var byName = {};
+					((snap && snap.tracks) || []).forEach (function ( t ) { byName[t.name] = t; });
+
+					var chain = Promise.resolve ();
+					layout.tracks.forEach (function ( tdef ) {
+						var bt = byName[tdef.name];
+						if (!bt) { warnings.push ('layOutShow: track "' + tdef.name + '" missing after layInShow'); return; }
+						(tdef.clips || []).forEach (function ( cdef, ci ) {
+							var hasFade = (typeof cdef.fadeIn === 'number') || (typeof cdef.fadeOut === 'number');
+							if (!hasFade) return;
+							var bc = bt.clips[ci];
+							if (!bc) { warnings.push ('layOutShow: clip ' + ci + ' on "' + tdef.name + '" missing for fade'); return; }
+							chain = chain.then (function () {
+								var fa = { clipId: bc.id };
+								if (typeof cdef.fadeIn  === 'number') fa.inSecs  = cdef.fadeIn;
+								if (typeof cdef.fadeOut === 'number') fa.outSecs = cdef.fadeOut;
+								return callVerb ('fadeClip', fa)
+									.then (function () { fadesApplied++; })
+									.catch (function ( e ) { warnings.push ('layOutShow: fadeClip "' + tdef.name + '"[' + ci + ']: ' + (e && e.message ? e.message : e)); });
+							});
+						});
+					});
+					return chain;
+				}).then (function () {
+					if (!duck) return false;
+					var snap = projectSnapshot ();
+					var byName = {};
+					((snap && snap.tracks) || []).forEach (function ( t ) { byName[t.name] = t; });
+					var vt = byName[duck.voiceTrack], mtk = byName[duck.musicTrack];
+					if (!vt || !mtk) {
+						warnings.push ('layOutShow: duck skipped — voiceTrack/musicTrack not found (' + duck.voiceTrack + ' / ' + duck.musicTrack + ')');
+						return false;
+					}
+					return callVerb ('duckMusicUnderVoice', {
+						voiceTrackId: vt.id, musicTrackId: mtk.id,
+						underDb: (typeof duck.underDb === 'number') ? duck.underDb : 14
+					}).then (function () { return true; })
+					  .catch (function ( e ) { warnings.push ('layOutShow: duck failed: ' + (e && e.message ? e.message : e)); return false; });
+				}).then (function ( ducked ) {
+					return {
+						clipsAdded:   clipsAdded,
+						fadesApplied: fadesApplied,
+						ducked:       !!ducked,
+						warnings:     warnings,
+						project:      projectSnapshot ()
+					};
+				});
+				return async (p);
+			}
+		},
+
 		// ---- GENERATION HOOKS (STUBS) --------------------------------------
 		// Present + discoverable now; wired to the real render pipeline LATER.
 		// Each validates its inputs and returns {stub:true,...} — never a silent
