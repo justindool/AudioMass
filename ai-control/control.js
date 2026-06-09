@@ -423,6 +423,80 @@
 			}
 		},
 
+		getBoard: {
+			help: 'Authoritative multitrack board view: fuses the MODEL (each clip\'s startSec/lenSec/fadeIn/fadeOut per track) with the LIVE DOM pixel positions and a pixels-per-second mapping, so you know exactly where every clip sits both in time and on screen — the basis for precise, deterministic clip placement/moves. Multitrack only (use getProject for single-track). Returns {multitrack,duration,pixelsPerSecond,timelineOriginPx,tracks:[{id,name,vol,pan,mute,solo,domRect,clips:[{id,name,startSec,lenSec,fadeIn,fadeOut,domRect,startPx,endPx}]}]}. timeToPx(t)=timelineOriginPx+t*pixelsPerSecond.',
+			run: function () {
+				if (!multitrackOn ()) throw new Error ('getBoard is multitrack-only; use getProject for single-track (call enableMultitrack({on:true}) first)');
+				var st = mtState () || {};
+				var clips = st.clips || [];
+				var tracks = st.tracks || [];
+
+				function clipLen ( c ) {
+					var inn = c.in || 0;
+					var out = (c.out === undefined && c.buffer) ? c.buffer.duration : c.out;
+					return (typeof out === 'number') ? Math.max (0, out - inn) : null;
+				}
+				function rectOf ( el ) {
+					if (!el) return null;
+					var r = el.getBoundingClientRect ();
+					return { x: Math.round (r.left), y: Math.round (r.top), w: Math.round (r.width), h: Math.round (r.height) };
+				}
+
+				// Derive pixels-per-second + the timeline's x-origin from any clip that
+				// has both a known length and a rendered DOM box. This is the ruler that
+				// lets us convert any time <-> pixel for deterministic gestures.
+				var pps = null, originPx = null;
+				for (var i = 0; i < clips.length; ++i) {
+					var c = clips[i];
+					var el = clipEl (c.id);
+					if (!el) continue;
+					var r = el.getBoundingClientRect ();
+					var len = clipLen (c);
+					if (len && len > 0 && r.width > 0) {
+						pps = r.width / len;
+						originPx = r.left - (c.start || 0) * pps;
+						break;
+					}
+				}
+
+				var outTracks = tracks.map (function ( t ) {
+					var tclips = clips.filter (function ( c ) { return c.track === t.id; }).map (function ( c ) {
+						var el = clipEl (c.id);
+						var r = el ? el.getBoundingClientRect () : null;
+						return {
+							id:       c.id,
+							name:     c.name,
+							startSec: c.start || 0,
+							lenSec:   clipLen (c),
+							fadeIn:   c.fi || 0,
+							fadeOut:  c.fo || 0,
+							domRect:  rectOf (el),
+							startPx:  r ? Math.round (r.left) : null,
+							endPx:    r ? Math.round (r.right) : null
+						};
+					});
+					return {
+						id:      t.id,
+						name:    t.name,
+						vol:     (t.vol === undefined ? 1 : t.vol),
+						pan:     t.pan || 0,
+						mute:    !!t.mute,
+						solo:    !!t.solo,
+						domRect: rectOf (trackRow (t.id)),
+						clips:   tclips
+					};
+				});
+
+				return {
+					multitrack:      true,
+					duration:        duration (),
+					pixelsPerSecond: (pps !== null) ? Math.round (pps * 1000) / 1000 : null,
+					timelineOriginPx: (originPx !== null) ? Math.round (originPx) : null,
+					tracks:          outTracks
+				};
+			}
+		},
+
 		play: {
 			help: 'Start playback (RequestPlay).',
 			run: function () {
