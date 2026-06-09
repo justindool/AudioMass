@@ -1507,7 +1507,7 @@
 		},
 
 		layInShow: {
-			help: 'Author a whole board from JSON {layout:{tracks:[{name, clips:[{url, at}]}]}}: enter multitrack, create+name each track, and addClip every clip at its {at} seconds. Composes enableMultitrack + addTrack + addClip. PATH: one addTrack per layout track (renamed), then sequential addClip per clip (at = clip.at, default 0). Returns the resulting getProject snapshot plus {tracksCreated, clipsAdded, warnings}. Async.',
+			help: 'Author a whole board from JSON {layout:{tracks:[{name, clips:[{url, at}]}]}}: enter multitrack, then produce EXACTLY the layout\'s tracks with no orphan channels. Composes enableMultitrack + getProject + renameTrack/addTrack + addClip + removeTrack. PATH: entering multitrack auto-creates default channels (e.g. mt1/mt2); this REUSES them — renameTrack(existingId, layoutName) for the first layout entries and only addTrack for layout tracks beyond the existing count — then addClip every clip at its {at} (default 0). After clips are laid, any leftover EMPTY tracks are removed, respecting the engine\'s minimum-track guard (removeTrack refuses below 2 tracks): if removing an empty would drop below the minimum, one empty track is left rather than erroring (reported in warnings). Returns the resulting getProject snapshot plus {tracksReused, tracksCreated, tracksRemoved, clipsAdded, warnings}. Async.',
 			run: function ( args ) {
 				args = args || {};
 				var layout = args.layout;
@@ -1527,16 +1527,44 @@
 				});
 
 				var warnings = [];
-				var tracksCreated = 0, clipsAdded = 0;
+				var tracksReused = 0, tracksCreated = 0, tracksRemoved = 0, clipsAdded = 0;
+				// Track ids the layout claims (reused or created) so leftover-cleanup
+				// never touches a layout track even if it ended up empty.
+				var layoutTrackIds = {};
 
 				var p = ensureMultitrack ().then (function () {
+					// Read the tracks that already exist (entering multitrack auto-creates
+					// default channels, e.g. mt1/mt2). We REUSE these for the first layout
+					// entries rather than adding a fresh track per layout track (which left
+					// orphan empty defaults behind).
+					var existing = projectSnapshot ();
+					var existingTracks = (existing && Array.isArray (existing.tracks)) ? existing.tracks : [];
+					var existingIds = existingTracks.map (function ( t ) { return t.id; });
+
 					var chain = Promise.resolve ();
 					tracks.forEach (function ( tdef, ti ) {
 						chain = chain.then (function () {
 							var name = (typeof tdef.name === 'string' && tdef.name.trim ()) ? tdef.name.trim () : ('Track ' + (ti + 1));
-							return callVerb ('addTrack', { name: name }).then (function ( track ) {
-								if (!track || !track.id) throw new Error ('layInShow: failed to create track "' + name + '"');
-								tracksCreated++;
+							// Reuse an existing track for the first entries; only create new
+							// tracks for layout entries beyond the existing-track count.
+							var reuseId = (ti < existingIds.length) ? existingIds[ti] : null;
+							var ensureTrack;
+							if (reuseId) {
+								ensureTrack = callVerb ('renameTrack', { id: reuseId, name: name }).then (function ( track ) {
+									if (!track || !track.id) throw new Error ('layInShow: failed to rename existing track "' + name + '"');
+									tracksReused++;
+									layoutTrackIds[track.id] = true;
+									return track;
+								});
+							} else {
+								ensureTrack = callVerb ('addTrack', { name: name }).then (function ( track ) {
+									if (!track || !track.id) throw new Error ('layInShow: failed to create track "' + name + '"');
+									tracksCreated++;
+									layoutTrackIds[track.id] = true;
+									return track;
+								});
+							}
+							return ensureTrack.then (function ( track ) {
 								var clipChain = Promise.resolve ();
 								(tdef.clips || []).forEach (function ( cdef ) {
 									clipChain = clipChain.then (function () {
@@ -1552,9 +1580,43 @@
 							});
 						});
 					});
+
+					// After all clips are laid, remove leftover EMPTY tracks (the orphan
+					// default channels we never claimed and that hold no clips). Respect the
+					// engine's minimum-track guard: removeTrack refuses below 2 tracks, so if
+					// removing an empty would drop the board under the minimum we leave that
+					// one empty track rather than erroring.
+					chain = chain.then (function () {
+						var now = projectSnapshot ();
+						var current = (now && Array.isArray (now.tracks)) ? now.tracks : [];
+						var leftover = current.filter (function ( t ) {
+							return !layoutTrackIds[t.id] && (!t.clips || !t.clips.length);
+						});
+						var removeChain = Promise.resolve ();
+						leftover.forEach (function ( t ) {
+							removeChain = removeChain.then (function () {
+								// Re-read live count: the guard is on the CURRENT track total.
+								var snap = projectSnapshot ();
+								var count = (snap && Array.isArray (snap.tracks)) ? snap.tracks.length : 0;
+								if (count < 2) {
+									warnings.push ('left empty track "' + t.name + '" (' + t.id + '): removing it would drop below the engine minimum of 2 tracks');
+									return;
+								}
+								return callVerb ('removeTrack', { id: t.id })
+									.then (function () { tracksRemoved++; })
+									.catch (function ( err ) {
+										warnings.push ('could not remove leftover empty track "' + t.name + '" (' + t.id + '): ' + (err && err.message ? err.message : err));
+									});
+							});
+						});
+						return removeChain;
+					});
+
 					return chain.then (function () {
 						return {
+							tracksReused: tracksReused,
 							tracksCreated: tracksCreated,
+							tracksRemoved: tracksRemoved,
 							clipsAdded: clipsAdded,
 							warnings: warnings,
 							project: projectSnapshot ()
