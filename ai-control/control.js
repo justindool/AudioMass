@@ -1392,6 +1392,125 @@
 			}
 		},
 
+		fadeClip: {
+			help: 'Set a per-clip fade in MULTITRACK: {clipId, inSecs, outSecs} (seconds; pass either/both). AudioMass sets multitrack clip fades ONLY via mouse-dragging the clip\'s fade handles, so this drives those handles synthetically (upstream untouched) and SELF-CORRECTS against the model (re-measures fi/fo and re-drags until it matches), so snapping can\'t throw it off. Returns {clipId, fadeIn, fadeOut, requested, project}. Multitrack only; for single-track use applyStandardFades.',
+			run: function ( args ) {
+				requireMT ();
+				args = args || {};
+				var clipId = args.clipId;
+				if (!clipId || typeof clipId !== 'string') throw new Error ('fadeClip requires args.clipId (clip id string)');
+				if (!findMtClip (clipId)) throw new Error ('fadeClip: no clip with id ' + clipId);
+				var wantIn  = (typeof args.inSecs  === 'number' && isFinite (args.inSecs))  ? Math.max (0, args.inSecs)  : null;
+				var wantOut = (typeof args.outSecs === 'number' && isFinite (args.outSecs)) ? Math.max (0, args.outSecs) : null;
+				if (wantIn === null && wantOut === null)
+					throw new Error ('fadeClip requires numeric inSecs and/or outSecs (seconds)');
+
+				function clipNow () { return findMtClip (clipId); }
+				function clipLenOf ( c ) {
+					var inn = c.in || 0;
+					var out = (c.out === undefined && c.buffer) ? c.buffer.duration : c.out;
+					return (typeof out === 'number') ? Math.max (0, out - inn) : 0;
+				}
+				// Rendered pixels-per-second == internal px_per_sec (clip width / length).
+				function pps () {
+					var ce = clipEl (clipId), c = clipNow ();
+					if (!ce || !c) return null;
+					var width = ce.getBoundingClientRect ().width;
+					var L = clipLenOf (c);
+					return (L > 0 && width > 0) ? (width / L) : null;
+				}
+
+				// Synthesize one fade-handle drag of dxPixels. side 'l'|'r'.
+				function dragHandle ( side, dxPixels ) {
+					return new Promise (function ( resolve, reject ) {
+						var ce = clipEl (clipId);
+						if (!ce) return reject (new Error ('fadeClip: clip element gone'));
+						var handle = ce.getElementsByClassName ('pk_mt_fade_' + side)[0];
+						if (!handle) return reject (new Error ('fadeClip: fade handle pk_mt_fade_' + side + ' not present'));
+						var r = handle.getBoundingClientRect ();
+						var x0 = r.left + r.width / 2, y0 = r.top + r.height / 2;
+						var dx = dxPixels;
+						if (Math.abs (dx) < 6) dx = dx < 0 ? -6 : 6; // clear the 4px move threshold
+						function fire ( type, target, cx, cy ) {
+							target.dispatchEvent (new MouseEvent (type, {
+								bubbles: true, cancelable: true, view: w, clientX: cx, clientY: cy, button: 0
+							}));
+						}
+						try {
+							fire ('mousedown', handle, x0, y0);
+							setTimeout (function () {
+								fire ('mousemove', d, x0 + dx, y0);
+								setTimeout (function () {
+									fire ('mouseup', d, x0 + dx, y0);
+									setTimeout (resolve, 60); // let the rAF redraw + state push settle
+								}, 12);
+							}, 12);
+						} catch ( e ) {
+							reject (e instanceof Error ? e : new Error (String (e)));
+						}
+					});
+				}
+
+				// Fade handles are only rendered while the clip is SELECTED, so select it
+				// first: a synthetic shift+mousedown on the clip body calls selectClip(),
+				// which re-renders the clip WITH its fade handles. (We send a mouseup too so
+				// that if the clip was already selected, the body-mousedown that would start a
+				// drag is closed with zero movement — a harmless no-op click either way.)
+				function selectClipDom () {
+					return new Promise (function ( resolve, reject ) {
+						var ce = clipEl (clipId);
+						if (!ce) return reject (new Error ('fadeClip: clip element not found in DOM'));
+						var r = ce.getBoundingClientRect ();
+						var cx = r.left + Math.min (40, r.width / 2), cy = r.top + r.height / 2;
+						ce.dispatchEvent (new MouseEvent ('mousedown', {
+							bubbles: true, cancelable: true, view: w, clientX: cx, clientY: cy, button: 0, shiftKey: true
+						}));
+						setTimeout (function () {
+							d.dispatchEvent (new MouseEvent ('mouseup', {
+								bubbles: true, cancelable: true, view: w, clientX: cx, clientY: cy, button: 0
+							}));
+							setTimeout (resolve, 70); // selectClip -> render() recreates the clip with fade handles
+						}, 12);
+					});
+				}
+
+				// Converge one side to its target by drag -> measure -> re-drag.
+				function setSide ( side, target ) {
+					var key = side === 'l' ? 'fi' : 'fo';
+					var tries = 0;
+					function step () {
+						var c = clipNow ();
+						if (!c) return Promise.reject (new Error ('fadeClip: clip gone mid-fade'));
+						var cur = c[key] || 0;
+						var diff = target - cur;
+						if (Math.abs (diff) <= 0.03 || tries >= 5) return Promise.resolve (cur);
+						var p = pps ();
+						if (p === null) return Promise.reject (new Error ('fadeClip: could not measure pixels/sec (clip not rendered?)'));
+						tries++;
+						// Left handle: +dx grows fi. Right handle: -dx grows fo (inverse).
+						var dx = (side === 'l' ? diff : -diff) * p;
+						return dragHandle ( side, dx ).then ( step );
+					}
+					return step ();
+				}
+
+				var chain = selectClipDom ();
+				if (wantIn  !== null) chain = chain.then (function () { return setSide ('l', wantIn);  });
+				if (wantOut !== null) chain = chain.then (function () { return setSide ('r', wantOut); });
+				var p = chain.then (function () {
+					var c = clipNow ();
+					return {
+						clipId:    clipId,
+						fadeIn:    c ? (c.fi || 0) : null,
+						fadeOut:   c ? (c.fo || 0) : null,
+						requested: { inSecs: wantIn, outSecs: wantOut },
+						project:   projectSnapshot ()
+					};
+				});
+				return async (p);
+			}
+		},
+
 		// ---- VERSION / FAN-OUT RECIPES -------------------------------------
 		// These compose enableMultitrack + addTrack + addClip + solo/remove for
 		// A/B version workflows. They never touch low-level multitrack internals.
