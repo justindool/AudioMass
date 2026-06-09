@@ -463,6 +463,44 @@
 			}
 		},
 
+		cut: {
+			help: 'Cut (delete) the current selection; audio after it shifts left. Requires a selection (RequestActionCut).',
+			run: function () {
+				if (!loaded ()) throw new Error ('cannot cut: no audio loaded');
+				if (!selection ()) throw new Error ('cannot cut: nothing selected — call select({start,end}) first');
+				app.fireEvent ('RequestActionCut');
+				return { applied: 'cut' };
+			}
+		},
+
+		"delete": {
+			help: 'Delete the current selection (alias of cut — removes the selected region, audio after shifts left). Requires a selection.',
+			run: function () {
+				if (!loaded ()) throw new Error ('cannot delete: no audio loaded');
+				if (!selection ()) throw new Error ('cannot delete: nothing selected — call select({start,end}) first');
+				app.fireEvent ('RequestActionCut');
+				return { applied: 'delete' };
+			}
+		},
+
+		copy: {
+			help: 'Copy the current selection to the clipboard (RequestActionCopy).',
+			run: function () {
+				if (!selection ()) throw new Error ('cannot copy: nothing selected');
+				app.fireEvent ('RequestActionCopy');
+				return { applied: 'copy' };
+			}
+		},
+
+		paste: {
+			help: 'Paste clipboard audio at the current cursor position (RequestActionPaste).',
+			run: function () {
+				if (!loaded ()) throw new Error ('cannot paste: no audio loaded');
+				app.fireEvent ('RequestActionPaste');
+				return { applied: 'paste' };
+			}
+		},
+
 		fadeIn: {
 			help: 'Apply a fade-in over the current selection, or the whole clip if nothing is selected (RequestActionFX_FadeIn).',
 			run: function () {
