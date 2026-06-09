@@ -306,6 +306,37 @@
 		});
 	}
 
+	// Claim a track named {name} WITHOUT orphaning default empties. Entering
+	// multitrack auto-creates default channels (e.g. mt1/mt2) that hold no clips;
+	// recipes that unconditionally addTrack leave those behind as orphan empties.
+	// claimTrack instead REUSES an existing empty (zero clips) track by renaming
+	// it, and only falls back to addTrack when no empty track exists. Returns a
+	// Promise resolving to the claimed track id. (This is the same reuse logic
+	// layInShow applies in-order; it does NOT remove other leftovers — callers
+	// that need leftover-cleanup keep doing that themselves.)
+	function claimTrack ( name ) {
+		var wanted = (typeof name === 'string' && name.trim ()) ? name.trim () : 'Track';
+		return ensureMultitrack ().then (function () {
+			var snap = projectSnapshot ();
+			var existing = (snap && Array.isArray (snap.tracks)) ? snap.tracks : [];
+			var empty = null;
+			for (var i = 0; i < existing.length; ++i) {
+				var t = existing[i];
+				if (t && (!t.clips || !t.clips.length)) { empty = t; break; }
+			}
+			if (empty) {
+				return callVerb ('renameTrack', { id: empty.id, name: wanted }).then (function ( track ) {
+					if (!track || !track.id) throw new Error ('claimTrack: failed to rename empty track to "' + wanted + '"');
+					return track.id;
+				});
+			}
+			return callVerb ('addTrack', { name: wanted }).then (function ( track ) {
+				if (!track || !track.id) throw new Error ('claimTrack: addTrack returned no track id');
+				return track.id;
+			});
+		});
+	}
+
 	// Find the single clip currently on a track (or null). Used by swapVersion.
 	function trackClips ( trackId ) {
 		var t = findMtTrack ( trackId );
@@ -1224,7 +1255,7 @@
 		// A/B version workflows. They never touch low-level multitrack internals.
 
 		addVersionAsTrack: {
-			help: 'A/B helper: enter multitrack if needed, create a new track named {name} (default "Version"), and lay {url} as a clip at 0s on it. Composes enableMultitrack + addTrack + addClip. Returns {track, clip, project}. Async (fetches+decodes the URL).',
+			help: 'A/B helper: enter multitrack if needed, claim a track named {name} (default "Version") — REUSING a default empty channel if one exists so no orphan empties are left, else adding one — and lay {url} as a clip at 0s on it. Composes enableMultitrack + (renameTrack|addTrack) + addClip. Returns {track, clip, project}. Async (fetches+decodes the URL).',
 			run: function ( args ) {
 				args = args || {};
 				var url  = args.url || args.path;
@@ -1232,13 +1263,15 @@
 				if (!url || typeof url !== 'string')
 					throw new Error ('addVersionAsTrack requires args.url (a string URL)');
 
-				var p = ensureMultitrack ()
-					.then (function () { return callVerb ('addTrack', { name: name }); })
-					.then (function ( track ) {
-						if (!track || !track.id) throw new Error ('addVersionAsTrack: addTrack returned no track id');
-						return callVerb ('addClip', { trackId: track.id, url: url, at: 0 })
+				var p = claimTrack (name)
+					.then (function ( trackId ) {
+						return callVerb ('addClip', { trackId: trackId, url: url, at: 0 })
 							.then (function ( clip ) {
-								return { track: track, clip: clip, project: projectSnapshot () };
+								var snap = projectSnapshot ();
+								var track = ((snap && Array.isArray (snap.tracks)) ? snap.tracks.filter (function ( t ) { return t.id === trackId; })[0] : null) ||
+									findMtTrack (trackId) ||
+									{ id: trackId, name: name };
+								return { track: track, clip: clip, project: snap };
 							});
 					});
 				return async (p);
@@ -1453,7 +1486,7 @@
 		},
 
 		assembleSegments: {
-			help: 'Lay segments {urls:[...]} back-to-back on ONE track with {gapSecs} (default 0.4) between them, computing each clip\'s start from the prior clip\'s length + gap. In multitrack it places clips with addClip onto {trackId} (a track is created if {trackId} is omitted). Composes enableMultitrack + addTrack + addClip. PATH: multitrack/addClip (each clip\'s decoded length feeds the next "at"; robust because addClip reports the real clip len). Returns {trackId, clips, project}. Async.',
+			help: 'Lay segments {urls:[...]} back-to-back on ONE track with {gapSecs} (default 0.4) between them, computing each clip\'s start from the prior clip\'s length + gap. In multitrack it places clips with addClip onto {trackId} (a track is CLAIMED if {trackId} is omitted — reusing a default empty channel if one exists so no orphan empties are left, else adding one). Composes enableMultitrack + (renameTrack|addTrack) + addClip. PATH: multitrack/addClip (each clip\'s decoded length feeds the next "at"; robust because addClip reports the real clip len). Returns {trackId, clips, project}. Async.',
 			run: function ( args ) {
 				args = args || {};
 				var urls = args.urls;
@@ -1471,10 +1504,9 @@
 						if (!findMtTrack (wantTrackId)) throw new Error ('assembleSegments: no track with id ' + wantTrackId);
 						ensureTrack = Promise.resolve (wantTrackId);
 					} else {
-						ensureTrack = callVerb ('addTrack', { name: 'Segments' }).then (function ( t ) {
-							if (!t || !t.id) throw new Error ('assembleSegments: could not create a track');
-							return t.id;
-						});
+						// Claim a track (reuse a default empty channel if present, else add)
+						// so a fresh assembleSegments does not orphan the auto-created empties.
+						ensureTrack = claimTrack ('Segments');
 					}
 					return ensureTrack.then (function ( trackId ) {
 						var clips = [];
