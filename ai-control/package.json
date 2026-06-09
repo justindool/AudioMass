@@ -1,0 +1,14 @@
+{
+  "name": "audiomass-ai-control",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AI control layer for AudioMass: a fixed-port WebSocket rendezvous bridge + in-page control client. Kept isolated from upstream for clean merges.",
+  "type": "commonjs",
+  "scripts": {
+    "bridge": "node bridge.js",
+    "selftest": "node test/bridge-selftest.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
