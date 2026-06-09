@@ -91,6 +91,42 @@
 		return isReady ();
 	}
 
+	function engine () {
+		return app && app.engine ? app.engine : null;
+	}
+
+	// Dismiss any open AudioMass modal (welcome.js / "Open or append" / FX dialogs).
+	// modal.js builds each modal as a <div class="pk_modal"> with a
+	// <a class="pk_modal_cancel"> whose onclick calls q.Destroy(). Clicking every
+	// open cancel button tears them all down. Returns how many we closed.
+	function dismissModals () {
+		var closed = 0;
+		try {
+			var cancels = d.getElementsByClassName ('pk_modal_cancel');
+			// Live HTMLCollection shrinks as we Destroy; snapshot to a plain array first.
+			var list = [].slice.call (cancels);
+			for (var i = 0; i < list.length; ++i) {
+				if (list[i] && list[i].onclick) { list[i].click (); ++closed; }
+			}
+		} catch ( _ ) {}
+		return closed;
+	}
+
+	// Fetch a URL as an ArrayBuffer. Returns a Promise (control.js targets modern
+	// browsers; the editor itself relies on fetch/Promise elsewhere).
+	function fetchArrayBuffer ( url ) {
+		return fetch (url, { credentials: 'same-origin' }).then (function ( res ) {
+			if (!res.ok) throw new Error ('fetch failed: HTTP ' + res.status + ' for ' + url);
+			return res.arrayBuffer ();
+		});
+	}
+
+	// Run a command that resolves asynchronously. The verb's run() returns a
+	// {__async:Promise} marker; the command handler awaits it and replies then.
+	function async ( promise ) {
+		return { __async: promise };
+	}
+
 	// ---- VERB DISPATCH TABLE ----------------------------------------------
 	// Each entry: { help:String, run:function(args)->data }
 	// Throwing inside run() (or returning normally) is caught by the command
@@ -248,6 +284,406 @@
 			}
 		},
 
+		dismissModal: {
+			help: 'Dismiss any open modal dialog (Welcome, Open/Append, FX dialogs) by clicking its cancel button. Returns {dismissed:<count>}.',
+			run: function () {
+				return { dismissed: dismissModals () };
+			}
+		},
+
+		loadAudio: {
+			help: 'Load audio into the editor from {url} (or {path}, treated as a same-origin URL). Fetches the bytes, then loads them through the editor\'s drag-drop ingest path (engine.LoadArrayBuffer). Resolves to a getProject-style snapshot once decoded {loaded:true,duration}.',
+			run: function ( args ) {
+				var url = args && (args.url || args.path);
+				if (!url || typeof url !== 'string') throw new Error ('loadAudio requires args.url (a string URL); args.path is accepted as a same-origin URL');
+				var eng = engine ();
+				if (!eng || !eng.LoadArrayBuffer) throw new Error ('editor engine not ready (LoadArrayBuffer unavailable)');
+
+				var wv = wavesurfer ();
+				// A "Welcome to AudioMass" modal (welcome.js) or any leftover modal would
+				// otherwise intercept the load; clear them first.
+				dismissModals ();
+
+				// engine.LoadArrayBuffer shows an "Open or append" modal when audio is
+				// ALREADY loaded (is_ready). We always want a clean OPEN-NEW, so force the
+				// backend into open-new mode and, if the modal still appears, dismiss it
+				// after kicking the load — but the cleaner route is: when already ready,
+				// drive the same internal load path with _add=0 and no modal by calling
+				// LoadArrayBuffer and immediately answering its modal. To keep it simple and
+				// faithful to the UI, we set _add=0 up front (matches the drag-drop path,
+				// ui.js -> LoadArrayBuffer(new Blob([e]))).
+				if (wv && wv.backend) { try { wv.backend._add = 0; } catch ( _ ) {} }
+
+				var startReady = isReady ();
+
+				var p = fetchArrayBuffer (url).then (function ( buf ) {
+					if (!buf || !buf.byteLength) throw new Error ('fetched empty body for ' + url);
+
+					return new Promise (function ( resolve, reject ) {
+						var done = false;
+						var timeoutMs = 30000;
+
+						function finish ( ok, errMsg ) {
+							if (done) return;
+							done = true;
+							app.stopListeningFor ('DidLoadFile', onLoad);
+							app.stopListeningFor ('ShowError', onError);
+							clearTimeout (timer);
+							if (ok) {
+								resolve ({
+									loaded:     loaded (),
+									duration:   duration (),
+									playhead:   playhead (),
+									selection:  selection (),
+									multitrack: multitrackOn (),
+									url:        url
+								});
+							} else {
+								reject (new Error (errMsg || 'failed to load audio'));
+							}
+						}
+
+						function onLoad () {
+							// DidLoadFile fires from engine.js wavesurfer 'ready' once decoded.
+							setTimeout (function () { finish (duration () > 0, 'audio loaded but duration is 0'); }, 30);
+						}
+						function onError ( msg ) {
+							finish (false, 'decode/load error: ' + (msg && msg.message ? msg.message : msg));
+						}
+
+						app.listenFor ('DidLoadFile', onLoad);
+						app.listenFor ('ShowError', onError);
+
+						// Kick the load via the editor's own ingest path (same as drag-drop).
+						try {
+							eng.LoadArrayBuffer ( new Blob ([ buf ]) );
+						} catch ( e ) {
+							finish (false, 'LoadArrayBuffer threw: ' + (e && e.message ? e.message : e));
+							return;
+						}
+
+						// If audio was already loaded, LoadArrayBuffer pops an "Open or append"
+						// modal and waits. Click OPEN NEW for the caller (deterministic).
+						if (startReady) {
+							setTimeout (function () {
+								try {
+									var btns = d.getElementsByClassName ('pk_modal_a_bottom');
+									for (var i = 0; i < btns.length; ++i) {
+										var t = (btns[i].innerHTML || '').toUpperCase ();
+										if (t.indexOf ('OPEN NEW') !== -1) { btns[i].click (); break; }
+									}
+								} catch ( _ ) {}
+							}, 40);
+						}
+
+						var timer = setTimeout (function () {
+							finish (false, 'timed out after ' + timeoutMs + 'ms waiting for DidLoadFile');
+						}, timeoutMs);
+					});
+				});
+
+				return async (p);
+			}
+		},
+
+		measureLUFS: {
+			help: 'Measure loudness of the current selection (or whole clip if none): returns the lufs.js report {lufs,rms,rmsDb,peak,peakDb,truePeak,truePeakDb,blocks}. READ-only, no mutation (RequestActionFX_Loudness).',
+			run: function () {
+				if (!loaded ()) throw new Error ('cannot measure: no audio loaded');
+				if (!(app._deps && app._deps.lufs)) throw new Error ('LUFS analysis unavailable (lufs dependency not loaded)');
+				if (multitrackOn ()) throw new Error ('measureLUFS is single-track only (multitrack analysis not wired)');
+				// engine.js RequestActionFX_Loudness(done) calls done(report) synchronously
+				// with AudioUtils.Loudness(start,len) -> lufs.analyze(...).
+				var report = null;
+				app.fireEvent ('RequestActionFX_Loudness', function ( r ) { report = r; });
+				if (!report) throw new Error ('loudness analysis returned no report');
+				return report;
+			}
+		},
+
+		export: {
+			help: 'Export/bounce the project to a file download. {format}=wav|mp3|flac (default wav), optional {name}, {kbps} (mp3), {selectionOnly:true} to export the selection, {stereo}, {bitDepth} (wav 16|24|32), {dither}. Triggers the browser download via engine.DownloadFile.',
+			run: function ( args ) {
+				if (!loaded ()) throw new Error ('cannot export: no audio loaded');
+				var eng = engine ();
+				if (!eng || !eng.DownloadFile) throw new Error ('export unavailable (engine.DownloadFile missing)');
+				args = args || {};
+				var format = (args.format || 'wav').toLowerCase ();
+				if (['wav', 'mp3', 'flac'].indexOf (format) === -1)
+					throw new Error ('export format must be one of wav, mp3, flac (got ' + format + ')');
+				var name = args.name || ('output.' + format);
+				if (name.indexOf ('.') === -1) name += '.' + format;
+				var kbps = (typeof args.kbps === 'number') ? args.kbps : 128;
+				// engine.DownloadFile(name, format, kbps, selection, stereo, bit_depth, dither)
+				// selection is [start,end] in seconds, or false/undefined for whole clip.
+				var sel = false;
+				if (args.selectionOnly) {
+					var s = selection ();
+					if (!s) throw new Error ('selectionOnly requested but nothing is selected');
+					sel = [ s.start, s.end ];
+				}
+				var stereo = args.stereo === undefined ? false : !!args.stereo;
+				var bitDepth = (typeof args.bitDepth === 'number') ? args.bitDepth : 16;
+				var dither = !!args.dither;
+
+				// DownloadFile is async (worker-based) and fires DidDownloadFile when done.
+				// We resolve when the encode finishes, or after a generous timeout.
+				var p = new Promise (function ( resolve ) {
+					var done = false;
+					function finish () {
+						if (done) return; done = true;
+						app.stopListeningFor ('DidDownloadFile', onDone);
+						clearTimeout (timer);
+						resolve ({ exported: true, format: format, name: name, selection: sel || null });
+					}
+					function onDone () { setTimeout (finish, 10); }
+					app.listenFor ('DidDownloadFile', onDone);
+					try {
+						eng.DownloadFile (name, format, kbps, sel, stereo, bitDepth, dither);
+					} catch ( e ) {
+						done = true;
+						app.stopListeningFor ('DidDownloadFile', onDone);
+						clearTimeout (timer);
+						throw e;
+					}
+					var timer = setTimeout (finish, 60000);
+				});
+				return async (p);
+			}
+		},
+
+		compressor: {
+			help: 'Apply dynamics compression to the selection/whole clip (RequestActionFX_Compressor). Args: {threshold,knee,ratio,attack,release,makeup} numbers (sensible defaults applied); each is sent as {val:n}.',
+			run: function ( args ) {
+				if (!loaded ()) throw new Error ('cannot compress: no audio loaded');
+				args = args || {};
+				function v ( x, def ) { return { val: (typeof x === 'number' && !isNaN (x)) ? x : def }; }
+				// ui-fx.js Compressor getvalue() builds {threshold,knee,ratio,attack,release,makeup}
+				// each as {val:n}; makeup is in dB (FXBank.Compressor converts via 10^(dB/20)).
+				var val = {
+					threshold: v (args.threshold, -24),
+					knee:      v (args.knee, 30),
+					ratio:     v (args.ratio, 12),
+					attack:    v (args.attack, 0.003),
+					release:   v (args.release, 0.25),
+					makeup:    v (args.makeup, 0)
+				};
+				app.fireEvent ('RequestActionFX_Compressor', val);
+				return { applied: 'compressor', params: val, range: selection () };
+			}
+		},
+
+		reverb: {
+			help: 'Apply reverb to the selection/whole clip (RequestActionFX_REVERB). Args: {mix:0..1 (default 0.5), time:seconds (default 2), decay:number (default 2), reverse:bool}.',
+			run: function ( args ) {
+				if (!loaded ()) throw new Error ('cannot apply reverb: no audio loaded');
+				args = args || {};
+				// actions.js Reverb expects val.mix, val.time, val.decay, val.reverse.
+				var val = {
+					mix:     (typeof args.mix === 'number') ? args.mix : 0.5,
+					time:    (typeof args.time === 'number') ? args.time : 2,
+					decay:   (typeof args.decay === 'number') ? args.decay : 2,
+					reverse: !!args.reverse
+				};
+				app.fireEvent ('RequestActionFX_REVERB', val);
+				return { applied: 'reverb', params: val, range: selection () };
+			}
+		},
+
+		paramEQ: {
+			help: 'Apply a parametric EQ to the selection/whole clip (RequestActionFX_PARAMEQ). Args: {bands:[{type,freq,val,q}]} where type is peaking|lowshelf|highshelf|lowpass|highpass|notch, freq in Hz, val in dB, q number.',
+			run: function ( args ) {
+				if (!loaded ()) throw new Error ('cannot apply paramEQ: no audio loaded');
+				args = args || {};
+				var bands = args.bands;
+				if (!Array.isArray (bands) || !bands.length)
+					throw new Error ('paramEQ requires args.bands: a non-empty array of {type,freq,val,q}');
+				// actions.js ParametricEQ(val): val is an array of band objects
+				// {type, freq, val(dB), q}.
+				var clean = bands.map (function ( b ) {
+					return {
+						type: b.type || 'peaking',
+						freq: (typeof b.freq === 'number') ? b.freq : 1000,
+						val:  (typeof b.val === 'number') ? b.val : 0,
+						q:    (typeof b.q === 'number') ? b.q : 1
+					};
+				});
+				app.fireEvent ('RequestActionFX_PARAMEQ', clean);
+				return { applied: 'paramEQ', bands: clean, range: selection () };
+			}
+		},
+
+		changeRate: {
+			help: 'Resample-style rate change (pitch + speed together) on the selection/whole clip (RequestActionFX_RATE). Args: {rate} multiplier (e.g. 1.5 faster/higher, 0.5 slower/lower). NOTE: engine RATE handler exists but its render path is uncertain; returns a request acknowledgement.',
+			run: function ( args ) {
+				if (!loaded ()) throw new Error ('cannot change rate: no audio loaded');
+				var rate = args && args.rate;
+				if (typeof rate !== 'number' || isNaN (rate) || rate <= 0)
+					throw new Error ('changeRate requires positive numeric args.rate');
+				// ui-fx.js fires RequestActionFX_RATE with a bare number value.
+				app.fireEvent ('RequestActionFX_RATE', rate);
+				return { applied: 'changeRate', rate: rate, range: selection () };
+			}
+		},
+
+		changeSpeed: {
+			help: 'Time-stretch the selection/whole clip preserving pitch (RequestActionFX_SPEED). Args: {speed} multiplier (>1 faster, <1 slower). Async render in engine; returns immediately after firing.',
+			run: function ( args ) {
+				if (!loaded ()) throw new Error ('cannot change speed: no audio loaded');
+				var speed = args && args.speed;
+				if (typeof speed !== 'number' || isNaN (speed) || speed <= 0)
+					throw new Error ('changeSpeed requires positive numeric args.speed');
+				// ui-fx.js fires RequestActionFX_SPEED with a bare number (or a profile object).
+				app.fireEvent ('RequestActionFX_SPEED', speed);
+				return { applied: 'changeSpeed', speed: speed, range: selection () };
+			}
+		},
+
+		hardLimit: {
+			help: 'Apply a hard/brickwall limiter to the selection/whole clip (RequestActionFX_HardLimit). Args: {ceiling:0..1 linear (default 1.0), ratio:0..1 (default 0), lookAheadMs:number (default 15)}. val array = [equally, ceiling, ratio, lookAhead].',
+			run: function ( args ) {
+				if (!loaded ()) throw new Error ('cannot hard-limit: no audio loaded');
+				args = args || {};
+				// actions.js HardLimit(val): val[1]=max(ceiling linear), val[2]=ratio, val[3]=lookAhead ms.
+				var ceiling = (typeof args.ceiling === 'number') ? args.ceiling : 1.0;
+				var ratio   = (typeof args.ratio === 'number') ? args.ratio : 0;
+				var look    = (typeof args.lookAheadMs === 'number') ? args.lookAheadMs : 15;
+				var val = [ false, ceiling, ratio, look ];
+				app.fireEvent ('RequestActionFX_HardLimit', val);
+				return { applied: 'hardLimit', ceiling: ceiling, ratio: ratio, lookAheadMs: look, range: selection () };
+			}
+		},
+
+		removeSilence: {
+			help: 'Detect and remove silent gaps within the selection/whole clip (RequestActionFX_RemSil). No tunable args confirmed in source (thresholds are hard-coded in engine.js).',
+			run: function () {
+				if (!loaded ()) throw new Error ('cannot remove silence: no audio loaded');
+				app.fireEvent ('RequestActionFX_RemSil');
+				return { applied: 'removeSilence', range: selection () };
+			}
+		},
+
+		deClick: {
+			help: 'Remove clicks/pops from the selection/whole clip (RequestActionFX_DeClick). Args: {sensitivity} number passed straight through to the de-click detector.',
+			run: function ( args ) {
+				if (!loaded ()) throw new Error ('cannot de-click: no audio loaded');
+				// engine.js RequestActionFX_DeClick(sens) — sensitivity value passed through.
+				var sens = (args && typeof args.sensitivity === 'number') ? args.sensitivity : undefined;
+				app.fireEvent ('RequestActionFX_DeClick', sens);
+				return { applied: 'deClick', sensitivity: sens === undefined ? 'default' : sens, range: selection () };
+			}
+		},
+
+		invert: {
+			help: 'Invert the phase/polarity of the selection/whole clip (RequestActionFX_Invert).',
+			run: function () {
+				if (!loaded ()) throw new Error ('cannot invert: no audio loaded');
+				app.fireEvent ('RequestActionFX_Invert');
+				return { applied: 'invert', range: selection () };
+			}
+		},
+
+		reverse: {
+			help: 'Reverse the selection/whole clip in time (RequestActionFX_Reverse).',
+			run: function () {
+				if (!loaded ()) throw new Error ('cannot reverse: no audio loaded');
+				app.fireEvent ('RequestActionFX_Reverse');
+				return { applied: 'reverse', range: selection () };
+			}
+		},
+
+		zoomIn: {
+			help: 'Zoom the waveform in horizontally (RequestZoom with mode 1). Optional {amount} pixels of zoom delta (default 120).',
+			run: function ( args ) {
+				if (!loaded ()) throw new Error ('cannot zoom: no audio loaded');
+				var amount = (args && typeof args.amount === 'number') ? args.amount : 120;
+				// engine.js RequestZoom(diff, mode): mode 1 zooms in.
+				app.fireEvent ('RequestZoom', amount, 1);
+				return { zoom: 'in', amount: amount };
+			}
+		},
+
+		zoomOut: {
+			help: 'Zoom the waveform out horizontally (RequestZoom with mode -1). Optional {amount} pixels of zoom delta (default 120).',
+			run: function ( args ) {
+				if (!loaded ()) throw new Error ('cannot zoom: no audio loaded');
+				var amount = (args && typeof args.amount === 'number') ? args.amount : 120;
+				// engine.js RequestZoom(diff, mode): mode -1 zooms out.
+				app.fireEvent ('RequestZoom', amount, -1);
+				return { zoom: 'out', amount: amount };
+			}
+		},
+
+		zoomTo: {
+			help: 'Zoom so the given time {range:[start,end]} (seconds) is selected and then horizontally zoomed in around it. Selects the range then zooms in. (Best-effort: AudioMass has no direct fit-to-range verb.)',
+			run: function ( args ) {
+				if (!loaded ()) throw new Error ('cannot zoom: no audio loaded');
+				var range = args && args.range;
+				if (!Array.isArray (range) || range.length !== 2 || typeof range[0] !== 'number' || typeof range[1] !== 'number')
+					throw new Error ('zoomTo requires args.range = [startSeconds, endSeconds]');
+				// No native fit-to-range; select the range and zoom in around it.
+				app.fireEvent ('RequestRegionSet', range[0], range[1]);
+				app.fireEvent ('RequestZoom', 240, 1);
+				return { zoom: 'to', range: selection () };
+			}
+		},
+
+		centerToCursor: {
+			help: 'Scroll the view so the playback cursor is centered (RequestViewCenterToCursor).',
+			run: function () {
+				if (!loaded ()) throw new Error ('cannot center: no audio loaded');
+				app.fireEvent ('RequestViewCenterToCursor');
+				return { centered: true, playhead: playhead () };
+			}
+		},
+
+		pan: {
+			help: 'Pan/scroll the waveform horizontally (RequestPan). Args: {amount} pixels to pan (positive scrolls right). Only meaningful while zoomed in.',
+			run: function ( args ) {
+				if (!loaded ()) throw new Error ('cannot pan: no audio loaded');
+				var amount = args && args.amount;
+				if (typeof amount !== 'number' || isNaN (amount)) throw new Error ('pan requires numeric args.amount (pixels)');
+				// engine.js RequestPan(diff, mode): default mode pans by visible-duration fraction.
+				app.fireEvent ('RequestPan', amount);
+				return { panned: amount };
+			}
+		},
+
+		addMarker: {
+			help: 'Add a marker at {time} seconds (default: current playhead) with optional {label} and {color} (#rgb/#rrggbb). Uses the MrkrAdd event (markers.js). Single-track only.',
+			run: function ( args ) {
+				if (!loaded ()) throw new Error ('cannot add marker: no audio loaded');
+				if (!app.mrk) throw new Error ('markers unavailable (app.mrk not initialized)');
+				args = args || {};
+				// markers.js drop(o): o.time present -> add at time; else at current cursor.
+				var o = {};
+				if (typeof args.time === 'number' && !isNaN (args.time)) o.time = args.time;
+				if (typeof args.label === 'string') o.name = args.label;
+				if (typeof args.color === 'string') o.color = args.color;
+				app.fireEvent ('MrkrAdd', o);
+				// Read back the (single-track) marker list so the caller sees the result.
+				var list = app.mrk.serEd ? app.mrk.serEd () : [];
+				return { added: true, markers: list };
+			}
+		},
+
+		listMarkers: {
+			help: 'List all single-track markers as [{id,time,name,color,loop}] (markers.js serEd()).',
+			run: function () {
+				if (!app.mrk || !app.mrk.serEd) throw new Error ('markers unavailable (app.mrk not initialized)');
+				return app.mrk.serEd ();
+			}
+		},
+
+		clearMarkers: {
+			help: 'Remove all single-track markers (markers.js clearEd()). Returns {cleared:bool}.',
+			run: function () {
+				if (!app.mrk || !app.mrk.clearEd) throw new Error ('markers unavailable (app.mrk not initialized)');
+				var did = app.mrk.clearEd ();
+				return { cleared: !!did };
+			}
+		},
+
 		listVerbs: {
 			help: 'List every supported verb with a one-line help string.',
 			run: function () {
@@ -275,6 +711,15 @@
 
 		try {
 			var data = entry.run (args);
+			// Async verbs (e.g. loadAudio, export) return { __async: Promise }.
+			if (data && data.__async && typeof data.__async.then === 'function') {
+				data.__async.then (function ( res ) {
+					reply (reqId, true, res === undefined ? null : res, null);
+				}, function ( err ) {
+					reply (reqId, false, null, (err && err.message) ? err.message : String (err));
+				});
+				return;
+			}
 			reply (reqId, true, data === undefined ? null : data, null);
 		} catch ( err ) {
 			reply (reqId, false, null, (err && err.message) ? err.message : String (err));
