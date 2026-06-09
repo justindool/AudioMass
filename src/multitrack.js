@@ -5470,6 +5470,37 @@
 				return true;
 			}
 
+			// ---- AI-CONTROL additive commands (carried patch — see ai-control/) -------
+			// Programmatic clip fade / move by id, so an AI controller can set per-clip
+			// fades and reposition clips WITHOUT synthesizing mouse-drag gestures. These
+			// mirror the exact commit the mouse-drag handlers use (cloneState -> mutate ->
+			// pushState -> render), so undo/redo and redraw behave identically. Additive
+			// only: appended before the final `return false`, so upstream merges stay clean.
+			if (id === 'RequestSetClipFade') {
+				var _fc = findClip ( arg1 && arg1.id );
+				if (!_fc) return true;
+				var _fprev = cloneState ();
+				if (typeof arg1.fadeIn  === 'number') setClipFade ( _fc, 1, Math.max (0, arg1.fadeIn) );
+				if (typeof arg1.fadeOut === 'number') setClipFade ( _fc, 0, Math.max (0, arg1.fadeOut) );
+				pushState ( _fprev, 'Set Clip Fade' );
+				queuePlayRefresh ( true );
+				render ();
+				return true;
+			}
+			if (id === 'RequestMoveClip') {
+				var _mc = findClip ( arg1 && arg1.id );
+				if (!_mc) return true;
+				var _mprev = cloneState ();
+				if (typeof arg1.start === 'number') _mc.start = Math.max (0, arg1.start);
+				if (arg1.track && findTrack ( arg1.track )) _mc.track = arg1.track;
+				clampClipFades ( _mc );
+				publishDuration ( true );
+				pushState ( _mprev, 'Move Clip' );
+				queuePlayRefresh ( true );
+				render ();
+				return true;
+			}
+
 			return false;
 		};
 
