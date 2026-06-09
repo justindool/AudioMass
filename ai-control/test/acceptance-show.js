@@ -99,6 +99,26 @@ function trackByName(board, name) {
   const exp = (await c.send('export', { format: 'mp3', name: 'acceptance-show' })).data;
   assert('export (bounce) returned ok', exp && exp.exported === true);
 
+  // 6) layOutShow — the one-call path must produce the SAME arrangement.
+  await newProjectAndWait(c);
+  const lo = (await c.send('layOutShow', { layout: { tracks: [
+    { name: 'VO',    clips: [{ url: URL, at: 0,  fadeOut: 2 }] },
+    { name: 'Music', clips: [{ url: URL, at: 0,  fadeIn: 2, fadeOut: 3 }] },
+    { name: 'Outro', clips: [{ url: URL, at: 40, fadeIn: 1 }] }
+  ] }, duck: { voiceTrack: 'VO', musicTrack: 'Music', underDb: 14 } })).data;
+  assert('layOutShow: 3 clips added', lo && lo.clipsAdded === 3, lo && lo.clipsAdded);
+  assert('layOutShow: 3 fades applied', lo && lo.fadesApplied === 3, lo && lo.fadesApplied);
+  assert('layOutShow: ducked', lo && lo.ducked === true);
+  assert('layOutShow: no warnings', lo && Array.isArray(lo.warnings) && lo.warnings.length === 0,
+    lo && JSON.stringify(lo.warnings));
+
+  const lb = (await c.send('getBoard')).data;
+  const lvo = trackByName(lb, 'VO'), lmus = trackByName(lb, 'Music'), lout = trackByName(lb, 'Outro');
+  assert('layOutShow board: VO faded out ~2s', lvo && near(lvo.clips[0].fadeOut, 2, 0.1), lvo && lvo.clips[0].fadeOut.toFixed(2));
+  assert('layOutShow board: Music in~2 / out~3', lmus && near(lmus.clips[0].fadeIn, 2, 0.1) && near(lmus.clips[0].fadeOut, 3, 0.1));
+  assert('layOutShow board: Outro @40s in~1', lout && near(lout.clips[0].startSec, 40, 0.2) && near(lout.clips[0].fadeIn, 1, 0.1));
+  assert('layOutShow board: Music ducked ~0.20', lmus && near(lmus.vol, 0.1995, 0.03), lmus && lmus.vol.toFixed(3));
+
   const failed = checks.filter((c) => !c.pass).length;
   console.log(`\n${checks.length - failed}/${checks.length} checks passed`);
   c.close();
