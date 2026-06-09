@@ -767,6 +767,17 @@
 			}
 		},
 
+		newProject: {
+			help: 'Start a CLEAN SLATE — wipes the entire board (every track + clip, single- and multi-track) so nothing from a prior session bleeds in. AudioMass has no public clear, so this reliably resets by reloading the editor page from inside the page (works in any browser, no external tools). Replies {reloading:true} immediately, then reloads; the editor reconnects a moment later as a fresh empty project. The controller waits for that reconnect and returns the fresh getProject. Use this before laying out a new show.',
+			run: function () {
+				// The command handler sends our return value as the result synchronously;
+				// schedule the reload just AFTER so the controller receives this ack before
+				// the editor socket drops. control.js re-dials the bridge on the fresh load.
+				setTimeout (function () { try { w.location.reload (); } catch ( _ ) {} }, 150);
+				return { reloading: true, newProject: true };
+			}
+		},
+
 		measureLUFS: {
 			help: 'Measure loudness of the current selection (or whole clip if none): returns the lufs.js report {lufs,rms,rmsDb,peak,peakDb,truePeak,truePeakDb,blocks}. READ-only, no mutation (RequestActionFX_Loudness).',
 			run: function () {

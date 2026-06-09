@@ -326,6 +326,27 @@ function parseArgv(argv) {
 }
 
 function pretty(v) { return JSON.stringify(v, null, 2); }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * After a `newProject` (which reloads the editor page), wait for the editor to
+ * re-register on the bridge, then fetch the fresh project so the caller gets the
+ * clean-slate state in a single command. Robust to timing: waits for an
+ * `EditorConnected` event, then polls `getProject` until the reloaded editor answers.
+ */
+async function awaitReconnectThenGetProject(ctrl, target) {
+  let connected = 0;
+  const off = ctrl.on('EditorConnected', () => { connected++; });
+  const deadline = Date.now() + 12000;
+  while (connected < 1 && Date.now() < deadline) { await sleep(300); }
+  off();
+  await sleep(500); // let control.js finish wiring after the fresh load
+  for (let i = 0; i < 20; i++) {
+    try { return await ctrl.send('getProject', {}, target); }
+    catch (e) { await sleep(400); }
+  }
+  return null;
+}
 
 async function cliMain() {
   const opts = parseArgv(process.argv.slice(2));
@@ -380,6 +401,15 @@ async function cliMain() {
 
   try {
     const result = await ctrl.send(verb, args, opts.target);
+    // newProject reloads the editor; transparently wait for it to come back and
+    // return the fresh empty board, so a single command leaves a known clean state.
+    if (verb === 'newProject') {
+      const fresh = await awaitReconnectThenGetProject(ctrl, opts.target);
+      const out = opts.raw ? (fresh || result) : ((fresh && fresh.data) || result.data);
+      console.log(pretty(out));
+      ctrl.close();
+      process.exit(0);
+    }
     console.log(pretty(opts.raw ? result : result.data));
     ctrl.close();
     process.exit(0);
