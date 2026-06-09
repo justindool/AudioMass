@@ -250,6 +250,100 @@
 		return { __async: promise };
 	}
 
+	// ---- recipe plumbing ---------------------------------------------------
+	// Recipes (composite/version/show verbs) are built by CALLING the existing
+	// verb handlers — never by reimplementing their low-level logic. Because some
+	// handlers run synchronously (return plain data) and others return the
+	// {__async:Promise} marker, callVerb() normalizes both into a Promise that
+	// resolves with the handler's data (or rejects with its Error). This mirrors
+	// exactly what handleCommand() does for a remote command.
+	function callVerb ( name, args ) {
+		return new Promise (function ( resolve, reject ) {
+			var entry = VERBS[name];
+			if (!entry || typeof entry.run !== 'function') {
+				reject (new Error ('callVerb: unknown verb "' + name + '"'));
+				return;
+			}
+			var data;
+			try {
+				data = entry.run (args || {});
+			} catch ( e ) {
+				reject (e instanceof Error ? e : new Error (String (e)));
+				return;
+			}
+			if (data && data.__async && typeof data.__async.then === 'function') {
+				data.__async.then (resolve, function ( err ) {
+					reject (err instanceof Error ? err : new Error (String (err)));
+				});
+				return;
+			}
+			resolve (data === undefined ? null : data);
+		});
+	}
+
+	// A getProject-style snapshot, reused by recipes that mutate state so the
+	// caller always sees the resulting project. Calls the live getProject verb.
+	function projectSnapshot () {
+		try { return VERBS.getProject.run ({}); } catch ( _ ) { return null; }
+	}
+
+	// Sleep helper for recipes that need the editor to settle between UI-driven
+	// mutations (e.g. enableMultitrack toggling the DOM, MixerSet re-rendering).
+	function delay ( ms ) {
+		return new Promise (function ( r ) { setTimeout (r, ms); });
+	}
+
+	// Ensure multitrack is ON (idempotent). Returns a Promise. Composes the
+	// existing enableMultitrack verb; settles briefly so the MT DOM/state exists
+	// before subsequent track/clip operations run.
+	function ensureMultitrack () {
+		if (multitrackOn ()) return Promise.resolve (false);
+		return callVerb ('enableMultitrack', { on: true }).then (function () {
+			return delay (120).then (function () {
+				if (!multitrackOn ()) throw new Error ('failed to enter multitrack mode (enableMultitrack did not take)');
+				return true;
+			});
+		});
+	}
+
+	// Find the single clip currently on a track (or null). Used by swapVersion.
+	function trackClips ( trackId ) {
+		var t = findMtTrack ( trackId );
+		if (!t) return [];
+		var clips = (mtState () || {}).clips || [];
+		var out = [];
+		for (var i = 0; i < clips.length; ++i) if (clips[i].track === trackId) out.push (clips[i]);
+		return out;
+	}
+
+	// Try to measure LUFS of the whole clip (clears selection first). Returns the
+	// report or null on any failure — recipes treat a null as "could not measure"
+	// and fall back to relative adjustments rather than throwing.
+	function measureWholeSafe () {
+		try {
+			VERBS.clearSelection.run ({});
+		} catch ( _ ) {}
+		try {
+			return VERBS.measureLUFS.run ({});
+		} catch ( _ ) {
+			return null;
+		}
+	}
+
+	// The standard generation-stub payload. Generation verbs are intentionally
+	// stubs in this phase: they are present + discoverable, validate their inputs,
+	// and return a clear {stub:true,...} so callers never mistake them for a
+	// silent no-op. They will be wired to the real render pipeline later.
+	function genStub ( verb, extra ) {
+		var out = {
+			stub: true,
+			verb: verb,
+			note: 'generation not wired yet — will call the render pipeline (Fish API / music / SFX) in a later phase'
+		};
+		if (extra) for (var k in extra) if (extra.hasOwnProperty (k)) out[k] = extra[k];
+		return out;
+	}
+
 	// ---- VERB DISPATCH TABLE ----------------------------------------------
 	// Each entry: { help:String, run:function(args)->data }
 	// Throwing inside run() (or returning normally) is caught by the command
@@ -1122,6 +1216,442 @@
 				if (findMtClip (id))
 					throw new Error ('removeClip: fired delete but clip ' + id + ' is still present (clip selection likely did not take — multitrack clip selection is mouse-gesture driven). Consider deleting it via the UI.');
 				return { removed: id, tracks: mtTracks () };
+			}
+		},
+
+		// ---- VERSION / FAN-OUT RECIPES -------------------------------------
+		// These compose enableMultitrack + addTrack + addClip + solo/remove for
+		// A/B version workflows. They never touch low-level multitrack internals.
+
+		addVersionAsTrack: {
+			help: 'A/B helper: enter multitrack if needed, create a new track named {name} (default "Version"), and lay {url} as a clip at 0s on it. Composes enableMultitrack + addTrack + addClip. Returns {track, clip, project}. Async (fetches+decodes the URL).',
+			run: function ( args ) {
+				args = args || {};
+				var url  = args.url || args.path;
+				var name = (typeof args.name === 'string' && args.name.trim ()) ? args.name.trim () : 'Version';
+				if (!url || typeof url !== 'string')
+					throw new Error ('addVersionAsTrack requires args.url (a string URL)');
+
+				var p = ensureMultitrack ()
+					.then (function () { return callVerb ('addTrack', { name: name }); })
+					.then (function ( track ) {
+						if (!track || !track.id) throw new Error ('addVersionAsTrack: addTrack returned no track id');
+						return callVerb ('addClip', { trackId: track.id, url: url, at: 0 })
+							.then (function ( clip ) {
+								return { track: track, clip: clip, project: projectSnapshot () };
+							});
+					});
+				return async (p);
+			}
+		},
+
+		swapVersion: {
+			help: 'Replace whatever is on track {trackId} with a new version {url}: best-effort removeClip of the track\'s current clip(s), then addClip the new version (at the same start if known, else 0s). Composes removeClip + addClip. If a clip cannot be removed (multitrack clip selection is mouse-driven), it STILL adds the new version and reports the un-removed clips in {warnings}. Returns {trackId, removed, added, warnings, project}. Async.',
+			run: function ( args ) {
+				args = args || {};
+				var trackId = args.trackId;
+				var url     = args.url || args.path;
+				if (!trackId || typeof trackId !== 'string')
+					throw new Error ('swapVersion requires args.trackId (track id string)');
+				if (!url || typeof url !== 'string')
+					throw new Error ('swapVersion requires args.url (a string URL)');
+
+				var p = ensureMultitrack ().then (function () {
+					if (!findMtTrack (trackId)) throw new Error ('swapVersion: no track with id ' + trackId);
+					var existing = trackClips (trackId);
+					// Capture the start of the first existing clip so the new version
+					// lands where the old one was (falls back to 0).
+					var at = (existing.length && typeof existing[0].start === 'number') ? existing[0].start : 0;
+
+					var removed = [];
+					var warnings = [];
+					// Remove existing clips one at a time (best-effort, sequential).
+					var chain = Promise.resolve ();
+					existing.forEach (function ( c ) {
+						chain = chain.then (function () {
+							return callVerb ('removeClip', { id: c.id })
+								.then (function () { removed.push (c.id); })
+								.catch (function ( err ) {
+									warnings.push ('could not remove clip ' + c.id + ': ' + (err && err.message ? err.message : err));
+								});
+						});
+					});
+
+					return chain
+						.then (function () { return callVerb ('addClip', { trackId: trackId, url: url, at: at }); })
+						.then (function ( added ) {
+							return {
+								trackId:  trackId,
+								removed:  removed,
+								added:    added,
+								warnings: warnings,
+								project:  projectSnapshot ()
+							};
+						});
+				});
+				return async (p);
+			}
+		},
+
+		compareVersions: {
+			help: 'Solo ONLY the tracks in {trackIds:[...]} (so everything else is silenced) for A/B comparison. Un-solos every other track first, then solos each requested track. Composes soloTrack. Returns {soloed:[...], project}.',
+			run: function ( args ) {
+				var m = requireMT ();
+				args = args || {};
+				var ids = args.trackIds;
+				if (!Array.isArray (ids) || !ids.length)
+					throw new Error ('compareVersions requires args.trackIds: a non-empty array of track ids');
+				var all = mtTracks ();
+				if (!all.length) throw new Error ('compareVersions: no tracks present');
+				var want = {};
+				ids.forEach (function ( id ) { want[id] = true; });
+				// Validate every requested id exists before mutating anything.
+				ids.forEach (function ( id ) {
+					if (!findMtTrack (id)) throw new Error ('compareVersions: no track with id ' + id);
+				});
+
+				var p = Promise.resolve ();
+				all.forEach (function ( t ) {
+					var shouldSolo = !!want[t.id];
+					// Only toggle where state needs to change (soloTrack is idempotent-safe,
+					// but MixerSet toggles, so we set explicitly via the on flag).
+					p = p.then (function () {
+						return callVerb ('soloTrack', { id: t.id, on: shouldSolo });
+					});
+				});
+				return async (p.then (function () {
+					var soloed = mtTracks ().filter (function ( t ) { return t.solo; }).map (function ( t ) { return t.id; });
+					return { soloed: soloed, project: projectSnapshot () };
+				}));
+			}
+		},
+
+		// ---- COMPOSITE RECIPES ---------------------------------------------
+		// Compose primitive verbs + audio judgement. Single-track unless noted.
+
+		applyStandardFades: {
+			help: 'Apply a fade-in + fade-out to give clean edges. {inSecs}/{outSecs} (default 1 each) size the fade regions; if no selection exists the fades act on the whole clip (AudioMass FadeIn/FadeOut ignore length, so inSecs/outSecs select head/tail regions when {trackId} or the whole clip is in play). Composes select + fadeIn + fadeOut. Single-track (a {trackId} note is returned for multitrack). Returns {steps, project}. Async.',
+			run: function ( args ) {
+				args = args || {};
+				if (!loaded ()) throw new Error ('applyStandardFades: no audio loaded');
+				var inSecs  = (typeof args.inSecs  === 'number' && args.inSecs  >= 0) ? args.inSecs  : 1;
+				var outSecs = (typeof args.outSecs === 'number' && args.outSecs >= 0) ? args.outSecs : 1;
+				var notes = [];
+				if (multitrackOn ()) {
+					// FadeIn/FadeOut operate on the active single-track region/clip; in
+					// multitrack the per-clip fade is a different (mouse-driven) handle.
+					notes.push ('multitrack is ON: applyStandardFades operates on the active editor region, not per-track clip fade handles. For per-clip multitrack fades use the clip fade handles.');
+				}
+				var hadSel = !!selection ();
+				var dur = duration ();
+
+				var p = Promise.resolve ().then (function () {
+					// Fade-in over the head region.
+					if (!hadSel && dur > 0 && inSecs > 0) {
+						return callVerb ('select', { start: 0, end: Math.min (inSecs, dur) })
+							.then (function () { return callVerb ('fadeIn'); });
+					}
+					return callVerb ('fadeIn');
+				}).then (function () {
+					// Fade-out over the tail region.
+					if (!hadSel && dur > 0 && outSecs > 0) {
+						return callVerb ('select', { start: Math.max (0, dur - outSecs), end: dur })
+							.then (function () { return callVerb ('fadeOut'); });
+					}
+					return callVerb ('fadeOut');
+				}).then (function () {
+					if (!hadSel) { try { VERBS.clearSelection.run ({}); } catch ( _ ) {} }
+					return {
+						steps: { fadeIn: inSecs, fadeOut: outSecs, wholeClip: !hadSel },
+						notes: notes,
+						project: projectSnapshot ()
+					};
+				});
+				return async (p);
+			}
+		},
+
+		autoLevel: {
+			help: 'Loudness-match to {targetLUFS} (default -16): measure current LUFS, normalize to the target, then re-measure to confirm. Composes measureLUFS + normalizeLUFS. Single-track (multitrack is per-track best-effort and currently reports unsupported because measureLUFS is single-track only). Returns {targetLUFS, before, after, project}. Async.',
+			run: function ( args ) {
+				args = args || {};
+				if (!loaded ()) throw new Error ('autoLevel: no audio loaded');
+				var target = (typeof args.targetLUFS === 'number' && !isNaN (args.targetLUFS)) ? args.targetLUFS : -16;
+				if (multitrackOn ())
+					throw new Error ('autoLevel is single-track only (measureLUFS is not wired for multitrack). Disable multitrack or level each track\'s source individually.');
+
+				var p = Promise.resolve ().then (function () {
+					var before = measureWholeSafe ();
+					if (!before || typeof before.lufs !== 'number' || !isFinite (before.lufs))
+						throw new Error ('autoLevel: could not measure starting loudness');
+					return callVerb ('normalizeLUFS', { target: target })
+						.then (function () { return delay (60); })
+						.then (function () {
+							var after = measureWholeSafe ();
+							return {
+								targetLUFS: target,
+								before: before,
+								after: after,
+								achieved: !!(after && typeof after.lufs === 'number'),
+								project: projectSnapshot ()
+							};
+						});
+				});
+				return async (p);
+			}
+		},
+
+		duckMusicUnderVoice: {
+			help: 'Sit the music track {musicTrackId} ~{underDb} dB (default 14) below the voice track {voiceTrackId} so narration stays intelligible. If per-track LUFS can be measured it computes the exact reduction; otherwise it applies a sensible relative fader cut. Composes setTrackVolume (multitrack). Returns {musicTrackId, voiceTrackId, underDb, appliedDb, method, project}. Async.',
+			run: function ( args ) {
+				requireMT ();
+				args = args || {};
+				var musicId = args.musicTrackId, voiceId = args.voiceTrackId;
+				if (!musicId || typeof musicId !== 'string') throw new Error ('duckMusicUnderVoice requires args.musicTrackId');
+				if (!voiceId || typeof voiceId !== 'string') throw new Error ('duckMusicUnderVoice requires args.voiceTrackId');
+				if (!findMtTrack (musicId)) throw new Error ('duckMusicUnderVoice: no track with id ' + musicId);
+				if (!findMtTrack (voiceId)) throw new Error ('duckMusicUnderVoice: no track with id ' + voiceId);
+				var underDb = (typeof args.underDb === 'number' && !isNaN (args.underDb)) ? Math.abs (args.underDb) : 14;
+
+				// measureLUFS is single-track only, so per-track LUFS isn't reachable in
+				// multitrack here. We use the documented, robust relative-cut path: pull
+				// the music fader down by underDb relative to its current level. setTrackVolume
+				// clamps to a 0..1 linear fader, so we read the current vol and scale it.
+				var music = findMtTrack (musicId);
+				var curLinear = (music && typeof music.vol === 'number') ? music.vol : 1;
+				var reduction = Math.pow (10, -underDb / 20);          // e.g. -14 dB -> ~0.1995
+				var targetLinear = curLinear * reduction;
+				if (targetLinear < 0) targetLinear = 0; else if (targetLinear > 1) targetLinear = 1;
+
+				var p = callVerb ('setTrackVolume', { id: musicId, linear: targetLinear })
+					.then (function ( track ) {
+						return {
+							musicTrackId: musicId,
+							voiceTrackId: voiceId,
+							underDb: underDb,
+							appliedDb: -underDb,
+							fromLinear: curLinear,
+							toLinear: targetLinear,
+							method: 'relative-fader-cut (per-track LUFS not available in multitrack; pulled music ' + underDb + ' dB below its current level)',
+							music: track,
+							project: projectSnapshot ()
+						};
+					});
+				return async (p);
+			}
+		},
+
+		trimDeadAir: {
+			help: 'Remove silent gaps from the selection/whole clip. Thin wrapper over removeSilence (+ snapshot). Returns {applied, project}. ',
+			run: function () {
+				if (!loaded ()) throw new Error ('trimDeadAir: no audio loaded');
+				var p = callVerb ('removeSilence').then (function ( res ) {
+					return { applied: 'trimDeadAir', removeSilence: res, project: projectSnapshot () };
+				});
+				return async (p);
+			}
+		},
+
+		assembleSegments: {
+			help: 'Lay segments {urls:[...]} back-to-back on ONE track with {gapSecs} (default 0.4) between them, computing each clip\'s start from the prior clip\'s length + gap. In multitrack it places clips with addClip onto {trackId} (a track is created if {trackId} is omitted). Composes enableMultitrack + addTrack + addClip. PATH: multitrack/addClip (each clip\'s decoded length feeds the next "at"; robust because addClip reports the real clip len). Returns {trackId, clips, project}. Async.',
+			run: function ( args ) {
+				args = args || {};
+				var urls = args.urls;
+				if (!Array.isArray (urls) || !urls.length)
+					throw new Error ('assembleSegments requires args.urls: a non-empty array of URL strings');
+				for (var i = 0; i < urls.length; ++i)
+					if (!urls[i] || typeof urls[i] !== 'string')
+						throw new Error ('assembleSegments: urls[' + i + '] is not a string URL');
+				var gap = (typeof args.gapSecs === 'number' && args.gapSecs >= 0) ? args.gapSecs : 0.4;
+				var wantTrackId = (typeof args.trackId === 'string' && args.trackId) ? args.trackId : null;
+
+				var p = ensureMultitrack ().then (function () {
+					var ensureTrack;
+					if (wantTrackId) {
+						if (!findMtTrack (wantTrackId)) throw new Error ('assembleSegments: no track with id ' + wantTrackId);
+						ensureTrack = Promise.resolve (wantTrackId);
+					} else {
+						ensureTrack = callVerb ('addTrack', { name: 'Segments' }).then (function ( t ) {
+							if (!t || !t.id) throw new Error ('assembleSegments: could not create a track');
+							return t.id;
+						});
+					}
+					return ensureTrack.then (function ( trackId ) {
+						var clips = [];
+						var cursor = 0; // next start position (seconds)
+						var chain = Promise.resolve ();
+						urls.forEach (function ( url, idx ) {
+							chain = chain.then (function () {
+								var at = cursor;
+								return callVerb ('addClip', { trackId: trackId, url: url, at: at }).then (function ( clip ) {
+									clips.push (clip);
+									var len = (clip && typeof clip.len === 'number' && isFinite (clip.len)) ? clip.len : null;
+									if (len === null) {
+										// Could not learn the clip length; advance by gap only and
+										// flag it so the caller knows spacing may be imperfect.
+										clip && (clip.lenUnknown = true);
+										cursor = at + gap;
+									} else {
+										cursor = at + len + gap;
+									}
+								});
+							});
+						});
+						return chain.then (function () {
+							return { trackId: trackId, clips: clips, gapSecs: gap, project: projectSnapshot () };
+						});
+					});
+				});
+				return async (p);
+			}
+		},
+
+		layInShow: {
+			help: 'Author a whole board from JSON {layout:{tracks:[{name, clips:[{url, at}]}]}}: enter multitrack, create+name each track, and addClip every clip at its {at} seconds. Composes enableMultitrack + addTrack + addClip. PATH: one addTrack per layout track (renamed), then sequential addClip per clip (at = clip.at, default 0). Returns the resulting getProject snapshot plus {tracksCreated, clipsAdded, warnings}. Async.',
+			run: function ( args ) {
+				args = args || {};
+				var layout = args.layout;
+				if (!layout || typeof layout !== 'object') throw new Error ('layInShow requires args.layout (an object {tracks:[...]})');
+				var tracks = layout.tracks;
+				if (!Array.isArray (tracks) || !tracks.length)
+					throw new Error ('layInShow requires layout.tracks: a non-empty array of {name, clips:[...]}');
+				// Validate the whole layout up front so we fail before half-building a board.
+				tracks.forEach (function ( t, ti ) {
+					if (!t || typeof t !== 'object') throw new Error ('layInShow: layout.tracks[' + ti + '] is not an object');
+					if (t.clips !== undefined && !Array.isArray (t.clips))
+						throw new Error ('layInShow: layout.tracks[' + ti + '].clips must be an array');
+					(t.clips || []).forEach (function ( c, ci ) {
+						if (!c || typeof c !== 'object') throw new Error ('layInShow: tracks[' + ti + '].clips[' + ci + '] is not an object');
+						if (!c.url || typeof c.url !== 'string') throw new Error ('layInShow: tracks[' + ti + '].clips[' + ci + '] requires a string url');
+					});
+				});
+
+				var warnings = [];
+				var tracksCreated = 0, clipsAdded = 0;
+
+				var p = ensureMultitrack ().then (function () {
+					var chain = Promise.resolve ();
+					tracks.forEach (function ( tdef, ti ) {
+						chain = chain.then (function () {
+							var name = (typeof tdef.name === 'string' && tdef.name.trim ()) ? tdef.name.trim () : ('Track ' + (ti + 1));
+							return callVerb ('addTrack', { name: name }).then (function ( track ) {
+								if (!track || !track.id) throw new Error ('layInShow: failed to create track "' + name + '"');
+								tracksCreated++;
+								var clipChain = Promise.resolve ();
+								(tdef.clips || []).forEach (function ( cdef ) {
+									clipChain = clipChain.then (function () {
+										var at = (typeof cdef.at === 'number' && isFinite (cdef.at) && cdef.at >= 0) ? cdef.at : 0;
+										return callVerb ('addClip', { trackId: track.id, url: cdef.url, at: at })
+											.then (function () { clipsAdded++; })
+											.catch (function ( err ) {
+												warnings.push ('track "' + name + '" clip ' + cdef.url + ' @' + at + 's failed: ' + (err && err.message ? err.message : err));
+											});
+									});
+								});
+								return clipChain;
+							});
+						});
+					});
+					return chain.then (function () {
+						return {
+							tracksCreated: tracksCreated,
+							clipsAdded: clipsAdded,
+							warnings: warnings,
+							project: projectSnapshot ()
+						};
+					});
+				});
+				return async (p);
+			}
+		},
+
+		polishShow: {
+			help: 'One-shot finish pass: trimDeadAir -> autoLevel({targetLUFS}) -> applyStandardFades, in that order (remove dead air first so leveling/fades act on the tightened audio). {targetLUFS} default -16. Single-track (autoLevel/measureLUFS are single-track only; in multitrack the autoLevel step is skipped with a warning). Composes trimDeadAir + autoLevel + applyStandardFades. Returns {steps:[...], project}. Async.',
+			run: function ( args ) {
+				args = args || {};
+				if (!loaded ()) throw new Error ('polishShow: no audio loaded');
+				var target = (typeof args.targetLUFS === 'number' && !isNaN (args.targetLUFS)) ? args.targetLUFS : -16;
+				var steps = [];
+				var isMT = multitrackOn ();
+
+				var p = Promise.resolve ()
+					// 1) Tighten: remove dead air first.
+					.then (function () {
+						return callVerb ('trimDeadAir')
+							.then (function ( r ) { steps.push ({ step: 'trimDeadAir', ok: true, result: r }); })
+							.catch (function ( e ) { steps.push ({ step: 'trimDeadAir', ok: false, error: e && e.message ? e.message : String (e) }); });
+					})
+					// 2) Level to target (single-track only).
+					.then (function () {
+						if (isMT) {
+							steps.push ({ step: 'autoLevel', ok: false, skipped: true, error: 'skipped: autoLevel is single-track only (measureLUFS not wired for multitrack)' });
+							return;
+						}
+						return callVerb ('autoLevel', { targetLUFS: target })
+							.then (function ( r ) { steps.push ({ step: 'autoLevel', ok: true, result: r }); })
+							.catch (function ( e ) { steps.push ({ step: 'autoLevel', ok: false, error: e && e.message ? e.message : String (e) }); });
+					})
+					// 3) Clean edges.
+					.then (function () {
+						return callVerb ('applyStandardFades', {})
+							.then (function ( r ) { steps.push ({ step: 'applyStandardFades', ok: true, result: r }); })
+							.catch (function ( e ) { steps.push ({ step: 'applyStandardFades', ok: false, error: e && e.message ? e.message : String (e) }); });
+					})
+					.then (function () {
+						return { targetLUFS: target, steps: steps, project: projectSnapshot () };
+					});
+				return async (p);
+			}
+		},
+
+		// ---- GENERATION HOOKS (STUBS) --------------------------------------
+		// Present + discoverable now; wired to the real render pipeline LATER.
+		// Each validates its inputs and returns {stub:true,...} — never a silent
+		// no-op — so the overseer can see exactly what would be generated.
+
+		generateVoice: {
+			help: 'STUB (not wired yet): generate TTS narration from {text} in {voice}. Will call the voice render pipeline (Fish API) in a later phase. Returns {stub:true, verb:"generateVoice", text, voice, note}.',
+			run: function ( args ) {
+				args = args || {};
+				if (typeof args.text !== 'string' || !args.text.trim ())
+					throw new Error ('generateVoice requires non-empty args.text');
+				return genStub ('generateVoice', {
+					text: args.text,
+					voice: (typeof args.voice === 'string' && args.voice) ? args.voice : 'default'
+				});
+			}
+		},
+
+		generateMusic: {
+			help: 'STUB (not wired yet): generate background music from {prompt} of {secs} seconds. Will call the music render pipeline in a later phase. Returns {stub:true, verb:"generateMusic", prompt, secs, note}.',
+			run: function ( args ) {
+				args = args || {};
+				if (typeof args.prompt !== 'string' || !args.prompt.trim ())
+					throw new Error ('generateMusic requires non-empty args.prompt');
+				var secs = (typeof args.secs === 'number' && args.secs > 0) ? args.secs : null;
+				return genStub ('generateMusic', { prompt: args.prompt, secs: secs });
+			}
+		},
+
+		generateSFX: {
+			help: 'STUB (not wired yet): generate a sound effect from {prompt} of {secs} seconds. Will call the SFX render pipeline in a later phase. Returns {stub:true, verb:"generateSFX", prompt, secs, note}.',
+			run: function ( args ) {
+				args = args || {};
+				if (typeof args.prompt !== 'string' || !args.prompt.trim ())
+					throw new Error ('generateSFX requires non-empty args.prompt');
+				var secs = (typeof args.secs === 'number' && args.secs > 0) ? args.secs : null;
+				return genStub ('generateSFX', { prompt: args.prompt, secs: secs });
+			}
+		},
+
+		regenerateSegment: {
+			help: 'STUB (not wired yet): regenerate a given {segment} producing {n} (default 1) alternative takes. Will call the render pipeline in a later phase. Returns {stub:true, verb:"regenerateSegment", segment, n, note}.',
+			run: function ( args ) {
+				args = args || {};
+				if (args.segment === undefined || args.segment === null)
+					throw new Error ('regenerateSegment requires args.segment (the segment to regenerate)');
+				var n = (typeof args.n === 'number' && args.n >= 1) ? Math.floor (args.n) : 1;
+				return genStub ('regenerateSegment', { segment: args.segment, n: n });
 			}
 		},
 
