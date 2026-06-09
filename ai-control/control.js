@@ -95,6 +95,129 @@
 		return app && app.engine ? app.engine : null;
 	}
 
+	// ---- multitrack helpers ------------------------------------------------
+	// The PKMultitrack instance (src/multitrack.js) exposes a *narrow* public API
+	// on the object stored at app.multitrack:
+	//   Toggle(force), IsOn(), GetRegion(), GetCursor(), GetDuration(), HasClips(),
+	//   getState()  -> full {tracks:[{id,name,mute,solo,vol,pan,h,rec}], clips:[{id,track,start,in,out,fi,fo,name,buffer}], ...}
+	//   MixerData() -> {on, tracks:[{id,name,mute,solo,rec,sel,vol,pan,meter}], master},
+	//   MixerSet(id,key,val,done) -> mutate vol|pan|mute|solo|rec|select (the SUPPORTED mutators),
+	//   AddFilesAuto(fileList), Propagate(id,a,b).
+	// There is NO public addTrack/removeTrack/renameTrack/addClip/moveClip/removeClip;
+	// those are private closures. We drive them through the same DOM controls / Request*
+	// events the human UI uses (verified against multitrack.js), and read results back
+	// via getState(). Anything not reachable that way returns an informative error.
+
+	function mt () {
+		return (app && app.multitrack) ? app.multitrack : null;
+	}
+
+	function requireMT () {
+		var m = mt ();
+		if (!m) throw new Error ('multitrack module unavailable (app.multitrack not initialized)');
+		if (!m.IsOn || !m.IsOn ()) throw new Error ('multitrack mode is OFF; call enableMultitrack({on:true}) first');
+		return m;
+	}
+
+	// Snapshot of the live track/clip model via the public getState() (=cloneState).
+	function mtState () {
+		var m = mt ();
+		if (!m || !m.getState) return null;
+		try { return m.getState (); } catch ( _ ) { return null; }
+	}
+
+	function findMtTrack ( id ) {
+		var st = mtState ();
+		if (!st || !st.tracks) return null;
+		for (var i = 0; i < st.tracks.length; ++i)
+			if (st.tracks[i].id === id) return st.tracks[i];
+		return null;
+	}
+
+	function findMtClip ( id ) {
+		var st = mtState ();
+		if (!st || !st.clips) return null;
+		for (var i = 0; i < st.clips.length; ++i)
+			if (st.clips[i].id === id) return st.clips[i];
+		return null;
+	}
+
+	// Clean, serializable track summary (drops the heavy live AudioBuffer on clips).
+	function summarizeTrack ( t, clips ) {
+		var cl = [];
+		for (var i = 0; i < clips.length; ++i) {
+			var c = clips[i];
+			if (c.track !== t.id) continue;
+			var inn = c.in || 0;
+			var out = (c.out === undefined && c.buffer) ? c.buffer.duration : c.out;
+			cl.push ({
+				id:    c.id,
+				name:  c.name,
+				start: c.start || 0,
+				in:    inn,
+				out:   out,
+				len:   (typeof out === 'number') ? Math.max (0, out - inn) : null,
+				fadeIn:  c.fi || 0,
+				fadeOut: c.fo || 0
+			});
+		}
+		return {
+			id:    t.id,
+			name:  t.name,
+			mute:  !!t.mute,
+			solo:  !!t.solo,
+			vol:   t.vol === undefined ? 1 : t.vol,
+			pan:   t.pan || 0,
+			rec:   !!t.rec,
+			clips: cl
+		};
+	}
+
+	function mtTracks () {
+		var st = mtState ();
+		if (!st || !st.tracks) return [];
+		var clips = st.clips || [];
+		return st.tracks.map (function ( t ) { return summarizeTrack ( t, clips ); });
+	}
+
+	// The multitrack track row in the DOM: <div class="pk_mt_track" data-track="ID">.
+	function trackRow ( id ) {
+		var rows = d.getElementsByClassName ('pk_mt_track');
+		for (var i = 0; i < rows.length; ++i)
+			if (rows[i].getAttribute ('data-track') === id) return rows[i];
+		return null;
+	}
+
+	function clipEl ( id ) {
+		var els = d.getElementsByClassName ('pk_mt_clip');
+		for (var i = 0; i < els.length; ++i)
+			if (els[i].getAttribute ('data-clip') === id) return els[i];
+		return null;
+	}
+
+	// Rename a track by driving its row's name <input>. multitrack.js renderTrack wires
+	// input.onchange to commit the new name (and pushState). We set the value and fire
+	// a 'change' event so the same handler runs.
+	function renameTrackDom ( id, name ) {
+		var row = trackRow ( id );
+		if (!row) throw new Error ('renameTrack: track row for ' + id + ' not found in DOM');
+		var input = row.getElementsByTagName ('input')[0];
+		if (!input) throw new Error ('renameTrack: name input not found on track row ' + id);
+		input.value = name;
+		input.dispatchEvent (new Event ('change', { bubbles: true }));
+	}
+
+	// Best-effort filename for a clip label, derived from the URL path.
+	function fileNameFromUrl ( url ) {
+		try {
+			var clean = String (url).split ('?')[0].split ('#')[0];
+			var base = clean.substring (clean.lastIndexOf ('/') + 1);
+			return base || 'Audio';
+		} catch ( _ ) {
+			return 'Audio';
+		}
+	}
+
 	// Dismiss any open AudioMass modal (welcome.js / "Open or append" / FX dialogs).
 	// modal.js builds each modal as a <div class="pk_modal"> with a
 	// <a class="pk_modal_cancel"> whose onclick calls q.Destroy(). Clicking every
@@ -135,15 +258,17 @@
 	var VERBS = {
 
 		getProject: {
-			help: 'Return {loaded,duration,playhead,selection,multitrack} describing the current project state.',
+			help: 'Return {loaded,duration,playhead,selection,multitrack} describing the current project state. When multitrack is ON, also returns tracks:[{id,name,mute,solo,vol,pan,rec,clips:[{id,name,start,in,out,len,fadeIn,fadeOut}]}].',
 			run: function () {
-				return {
+				var out = {
 					loaded:     loaded (),
 					duration:   duration (),
 					playhead:   playhead (),
 					selection:  selection (),
 					multitrack: multitrackOn ()
 				};
+				if (multitrackOn ()) out.tracks = mtTracks ();
+				return out;
 			}
 		},
 
@@ -681,6 +806,322 @@
 				if (!app.mrk || !app.mrk.clearEd) throw new Error ('markers unavailable (app.mrk not initialized)');
 				var did = app.mrk.clearEd ();
 				return { cleared: !!did };
+			}
+		},
+
+		// ---- MULTITRACK -----------------------------------------------------
+
+		enableMultitrack: {
+			help: 'Enter or leave multitrack mode. Args: {on} (default true). Calls app.multitrack.Toggle(on). Returns {multitrack:<bool>, tracks:[...] }.',
+			run: function ( args ) {
+				var m = mt ();
+				if (!m || !m.Toggle) throw new Error ('multitrack module unavailable (app.multitrack.Toggle missing)');
+				var on = !(args && args.on === false); // default true
+				// multitrack.js Toggle(force) sets mode to !!force when force is defined.
+				m.Toggle ( on );
+				return { multitrack: multitrackOn (), tracks: multitrackOn () ? mtTracks () : [] };
+			}
+		},
+
+		addTrack: {
+			help: 'Add a new (empty) channel/track. Optional {name} renames it after creation. Returns the new track {id,name,mute,solo,vol,pan,rec,clips}. (Drives the "+" Add Channel button; multitrack.js exposes no public addTrack.)',
+			run: function ( args ) {
+				requireMT ();
+				var before = mtTracks ().map (function ( t ) { return t.id; });
+				// The "+" header button's onclick === addTrack() (multitrack.js buildHeader).
+				var add = d.getElementsByClassName ('pk_mt_add')[0];
+				if (!add) throw new Error ('Add Channel button (.pk_mt_add) not found in DOM');
+				add.click ();
+				// Find the track id that appeared (addTrack pushes one new track).
+				var after = mtTracks ();
+				var created = null;
+				for (var i = 0; i < after.length; ++i) {
+					if (before.indexOf (after[i].id) === -1) { created = after[i]; break; }
+				}
+				if (!created) throw new Error ('addTrack: clicked Add Channel but no new track appeared in state');
+				if (args && typeof args.name === 'string' && args.name.trim ()) {
+					renameTrackDom ( created.id, args.name.trim () );
+					created = findMtTrack (created.id);
+					created = created ? summarizeTrack (created, (mtState () || {}).clips || []) : null;
+				}
+				return created;
+			}
+		},
+
+		removeTrack: {
+			help: 'Remove a channel/track by {id} (and its clips). Returns {removed:<id>, tracks:[...]}. NOTE: multitrack.js refuses to remove the last remaining track (needs >= 2 tracks).',
+			run: function ( args ) {
+				requireMT ();
+				var id = args && args.id;
+				if (!id || typeof id !== 'string') throw new Error ('removeTrack requires args.id (track id string)');
+				if (!findMtTrack (id)) throw new Error ('removeTrack: no track with id ' + id);
+				if (mtTracks ().length < 2) throw new Error ('cannot remove the last track (multitrack.js keeps at least one)');
+				var row = trackRow (id);
+				if (!row) throw new Error ('removeTrack: track row for ' + id + ' not found in DOM');
+				// Each row has a .pk_mt_del button whose onclick === removeTrack(track).
+				var del = row.getElementsByClassName ('pk_mt_del')[0];
+				if (!del) throw new Error ('removeTrack: delete button (.pk_mt_del) not found on row');
+				del.click ();
+				if (findMtTrack (id)) throw new Error ('removeTrack: clicked delete but track ' + id + ' still present');
+				return { removed: id, tracks: mtTracks () };
+			}
+		},
+
+		renameTrack: {
+			help: 'Rename channel/track {id} to {name}. Returns the updated track summary. (Drives the track-row name input change handler.)',
+			run: function ( args ) {
+				requireMT ();
+				var id = args && args.id, name = args && args.name;
+				if (!id || typeof id !== 'string') throw new Error ('renameTrack requires args.id');
+				if (typeof name !== 'string' || !name.trim ()) throw new Error ('renameTrack requires non-empty args.name');
+				if (!findMtTrack (id)) throw new Error ('renameTrack: no track with id ' + id);
+				renameTrackDom ( id, name.trim () );
+				var t = findMtTrack (id);
+				if (!t || t.name !== name.trim ())
+					throw new Error ('renameTrack: name did not update (got "' + (t && t.name) + '")');
+				return summarizeTrack ( t, (mtState () || {}).clips || [] );
+			}
+		},
+
+		muteTrack: {
+			help: 'Mute/unmute channel/track {id}. Args: {id, on} (on default true). Uses app.multitrack.MixerSet(id,"mute",on). Returns the updated track summary.',
+			run: function ( args ) {
+				var m = requireMT ();
+				var id = args && args.id;
+				if (!id || typeof id !== 'string') throw new Error ('muteTrack requires args.id');
+				if (!findMtTrack (id)) throw new Error ('muteTrack: no track with id ' + id);
+				var on = !(args && args.on === false); // default true
+				if (!m.MixerSet) throw new Error ('app.multitrack.MixerSet unavailable');
+				m.MixerSet ( id, 'mute', on, true );
+				var t = findMtTrack (id);
+				return summarizeTrack ( t, (mtState () || {}).clips || [] );
+			}
+		},
+
+		soloTrack: {
+			help: 'Solo/unsolo channel/track {id}. Args: {id, on} (on default true). Uses app.multitrack.MixerSet(id,"solo",on). Soloing one or more tracks silences the rest — the basis for "solo only these" version compares. Returns the updated track summary.',
+			run: function ( args ) {
+				var m = requireMT ();
+				var id = args && args.id;
+				if (!id || typeof id !== 'string') throw new Error ('soloTrack requires args.id');
+				if (!findMtTrack (id)) throw new Error ('soloTrack: no track with id ' + id);
+				var on = !(args && args.on === false); // default true
+				if (!m.MixerSet) throw new Error ('app.multitrack.MixerSet unavailable');
+				m.MixerSet ( id, 'solo', on, true );
+				var t = findMtTrack (id);
+				return summarizeTrack ( t, (mtState () || {}).clips || [] );
+			}
+		},
+
+		setTrackVolume: {
+			help: 'Set channel/track {id} volume from {db} decibels (0 dB = unity). Internally MixerSet expects a 0..1 linear fader; db is mapped via 10^(db/20) and clamped to [0,1] (multitrack vol range). Pass {linear:0..1} to set the fader directly instead. Returns the updated track summary.',
+			run: function ( args ) {
+				var m = requireMT ();
+				var id = args && args.id;
+				if (!id || typeof id !== 'string') throw new Error ('setTrackVolume requires args.id');
+				if (!findMtTrack (id)) throw new Error ('setTrackVolume: no track with id ' + id);
+				if (!m.MixerSet) throw new Error ('app.multitrack.MixerSet unavailable');
+				var linear;
+				if (args && typeof args.linear === 'number' && !isNaN (args.linear)) {
+					linear = args.linear;
+				} else if (args && typeof args.db === 'number' && !isNaN (args.db)) {
+					linear = Math.pow (10, args.db / 20);
+				} else {
+					throw new Error ('setTrackVolume requires numeric args.db (decibels) or args.linear (0..1 fader)');
+				}
+				// multitrack.js MixerSet clamps vol to [0,1]; >0 dB (linear>1) saturates at unity.
+				if (linear < 0) linear = 0; else if (linear > 1) linear = 1;
+				m.MixerSet ( id, 'vol', linear, true );
+				var t = findMtTrack (id);
+				return summarizeTrack ( t, (mtState () || {}).clips || [] );
+			}
+		},
+
+		setTrackPan: {
+			help: 'Set channel/track {id} stereo pan {x} in -1 (hard left) .. +1 (hard right), 0 = center. Uses app.multitrack.MixerSet(id,"pan",x). Returns the updated track summary.',
+			run: function ( args ) {
+				var m = requireMT ();
+				var id = args && args.id;
+				if (!id || typeof id !== 'string') throw new Error ('setTrackPan requires args.id');
+				if (!findMtTrack (id)) throw new Error ('setTrackPan: no track with id ' + id);
+				var x = args && args.x;
+				if (typeof x !== 'number' || isNaN (x)) throw new Error ('setTrackPan requires numeric args.x (-1..1)');
+				if (x < -1) x = -1; else if (x > 1) x = 1; // multitrack.js clamps to [-1,1]
+				if (!m.MixerSet) throw new Error ('app.multitrack.MixerSet unavailable');
+				m.MixerSet ( id, 'pan', x, true );
+				var t = findMtTrack (id);
+				return summarizeTrack ( t, (mtState () || {}).clips || [] );
+			}
+		},
+
+		addClip: {
+			help: 'Lay an audio file onto the timeline as a clip. Args: {trackId, url, at}. Fetches the URL, then loads it as a clip onto track {trackId} starting at {at} seconds (default 0). THIS is the verb for placing generated files on the timeline. Resolves to {clipId,track,start,len,name} once decoded. Implemented via select-track + seek-marker + RequestLoadPickedFiles (the same path the UI uses; multitrack exposes no direct addClip).',
+			run: function ( args ) {
+				var m = requireMT ();
+				var trackId = args && args.trackId;
+				var url     = args && (args.url || args.path);
+				var at      = (args && typeof args.at === 'number' && !isNaN (args.at)) ? Math.max (0, args.at) : 0;
+				if (!trackId || typeof trackId !== 'string') throw new Error ('addClip requires args.trackId (track id string)');
+				if (!url || typeof url !== 'string') throw new Error ('addClip requires args.url (a string URL)');
+				if (!findMtTrack (trackId)) throw new Error ('addClip: no track with id ' + trackId);
+				if (!m.MixerSet) throw new Error ('app.multitrack.MixerSet unavailable (cannot target track)');
+
+				var clipIdsBefore = ((mtState () || {}).clips || []).map (function ( c ) { return c.id; });
+
+				// 1) Make the target track the selected track. multitrack.js addFiles uses
+				//    selected_track when invoked through RequestLoadPickedFiles.
+				m.MixerSet ( trackId, 'select' );
+
+				// 2) Move the multitrack cursor/marker to `at`. multitrack.js addFiles places
+				//    the clip at `marker` (set by SeekTo -> setCursorTime). SeekTo takes a 0..1
+				//    fraction of the project duration.
+				var dur = duration ();
+				// duration() floors at 30s in multitrack; if `at` exceeds it the clip would clamp.
+				var frac = (dur > 0) ? (at / dur) : 0;
+				if (frac < 0) frac = 0; else if (frac > 1) frac = 1;
+				app.fireEvent ('RequestSeekTo', frac);
+
+				var p = fetchArrayBuffer (url).then (function ( buf ) {
+					if (!buf || !buf.byteLength) throw new Error ('fetched empty body for ' + url);
+					return new Promise (function ( resolve, reject ) {
+						var done = false;
+						var timeoutMs = 30000;
+						var nameGuess = fileNameFromUrl ( url );
+
+						function finish ( clip, errMsg ) {
+							if (done) return;
+							done = true;
+							app.stopListeningFor ('DidUpdateMultitrack', onUpdate);
+							clearTimeout (timer);
+							if (clip) {
+								resolve ({
+									clipId: clip.id,
+									track:  clip.track,
+									start:  clip.start,
+									len:    clip.len,
+									name:   clip.name
+								});
+							} else {
+								reject (new Error (errMsg || 'addClip: clip did not appear'));
+							}
+						}
+
+						function newestClip () {
+							var clips = (mtState () || {}).clips || [];
+							for (var i = 0; i < clips.length; ++i) {
+								if (clipIdsBefore.indexOf (clips[i].id) === -1) {
+									// Reuse summarizeTrack's clip shaping by faking a one-clip track.
+									var c = clips[i];
+									var inn = c.in || 0;
+									var out = (c.out === undefined && c.buffer) ? c.buffer.duration : c.out;
+									return {
+										id: c.id, track: c.track, start: c.start || 0, name: c.name,
+										len: (typeof out === 'number') ? Math.max (0, out - inn) : null
+									};
+								}
+							}
+							return null;
+						}
+
+						function onUpdate () {
+							var c = newestClip ();
+							if (c) finish (c, null);
+						}
+
+						// addFiles fires DidUpdateMultitrack after the clip is decoded+placed.
+						app.listenFor ('DidUpdateMultitrack', onUpdate);
+
+						// 3) Build a Blob that looks like a dropped File (addFiles reads file.name
+						//    and FileReader.readAsArrayBuffer(file) works on a Blob), then drive
+						//    the documented RequestLoadPickedFiles path:
+						//      Propagate('RequestLoadPickedFiles', files) ->
+						//      addFiles(files, selected_track, marker).
+						var blob;
+						try {
+							blob = new Blob ([ buf ]);
+							try { blob.name = nameGuess; } catch ( _ ) {} // some engines: name is read-only on Blob
+						} catch ( e ) {
+							finish (null, 'addClip: could not build Blob: ' + (e && e.message ? e.message : e));
+							return;
+						}
+						// If name is read-only (native File), fall back to a File when available.
+						if (blob.name !== nameGuess && w.File) {
+							try { blob = new w.File ([ buf ], nameGuess); } catch ( _ ) {}
+						}
+
+						try {
+							app.fireEvent ('RequestLoadPickedFiles', [ blob ]);
+						} catch ( e ) {
+							finish (null, 'addClip: RequestLoadPickedFiles threw: ' + (e && e.message ? e.message : e));
+							return;
+						}
+
+						// In case the update fired synchronously before we could observe it.
+						var immediate = newestClip ();
+						if (immediate) { finish (immediate, null); return; }
+
+						var timer = setTimeout (function () {
+							var late = newestClip ();
+							finish (late, late ? null : 'addClip: timed out after ' + timeoutMs + 'ms (decode/place failed?)');
+						}, timeoutMs);
+					});
+				});
+
+				return async (p);
+			}
+		},
+
+		moveClip: {
+			help: 'Move clip {id} to start at {at} seconds, optionally onto {trackId}. BEST-EFFORT: multitrack.js exposes no public clip-move and clip drag is mouse-driven. Returns an informative error if it cannot be performed deterministically. (Use removeClip + addClip for a reliable reposition.)',
+			run: function ( args ) {
+				requireMT ();
+				var id = args && args.id;
+				if (!id || typeof id !== 'string') throw new Error ('moveClip requires args.id (clip id)');
+				if (!findMtClip (id)) throw new Error ('moveClip: no clip with id ' + id);
+				// Uncertainty: clip repositioning in multitrack.js happens only via bindClipDrag
+				// (mousedown/mousemove with snap logic) and has no public/event entry point.
+				// Synthesizing pixel-accurate drag events is not deterministic here, so rather
+				// than silently no-op we report this clearly. The reliable primitive for
+				// repositioning is removeClip(id) followed by addClip({trackId,url,at}).
+				throw new Error ('moveClip is not deterministically supported: multitrack.js has no public/event clip-move (drag is mouse-only). Reposition by removeClip + addClip instead.');
+			}
+		},
+
+		removeClip: {
+			help: 'Remove clip {id} from the timeline. BEST-EFFORT: selects the clip element in the DOM then fires RequestActionCut (delete). multitrack.js has no remove-clip-by-id API, so this depends on the clip being clickable; returns an informative error if the clip cannot be confirmed removed.',
+			run: function ( args ) {
+				requireMT ();
+				var id = args && args.id;
+				if (!id || typeof id !== 'string') throw new Error ('removeClip requires args.id (clip id)');
+				if (!findMtClip (id)) throw new Error ('removeClip: no clip with id ' + id);
+				var ce = clipEl (id);
+				if (!ce) throw new Error ('removeClip: clip element [data-clip=' + id + '] not found in DOM (is multitrack rendered?)');
+
+				// Select the clip: a shift+mousedown on the clip element calls selectClip(clip)
+				// (multitrack.js bindClipDrag). We dispatch a synthetic shift-click sequence.
+				// Uncertainty: this relies on the clip-drag select branch; if selection does not
+				// take, we abort rather than deleting the wrong clip.
+				try {
+					var rect = ce.getBoundingClientRect ();
+					var cx = rect.left + Math.min (8, rect.width / 2);
+					var cy = rect.top + rect.height / 2;
+					['mousedown', 'mouseup', 'click'].forEach (function ( type ) {
+						ce.dispatchEvent (new MouseEvent (type, {
+							bubbles: true, cancelable: true, view: w,
+							clientX: cx, clientY: cy, button: 0, shiftKey: true
+						}));
+					});
+				} catch ( e ) {
+					throw new Error ('removeClip: could not synthesize clip selection: ' + (e && e.message ? e.message : e));
+				}
+
+				// RequestActionCut with no arg + no active region deletes the selected clip
+				// (multitrack.js Propagate -> deleteSelectedClip()).
+				app.fireEvent ('RequestActionCut');
+
+				if (findMtClip (id))
+					throw new Error ('removeClip: fired delete but clip ' + id + ' is still present (clip selection likely did not take — multitrack clip selection is mouse-gesture driven). Consider deleting it via the UI.');
+				return { removed: id, tracks: mtTracks () };
 			}
 		},
 
