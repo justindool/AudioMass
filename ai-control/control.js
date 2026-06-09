@@ -95,6 +95,20 @@
 		return app && app.engine ? app.engine : null;
 	}
 
+	// Cheap single-track audio facts (sample rate / channel count) read straight
+	// off the decoded AudioBuffer. Returns null if not available. Used to enrich
+	// getProject so one read tells the AI "what kind of audio is this" without an
+	// extra round-trip. (Loudness is deliberately NOT auto-measured here — it is
+	// expensive; use measureLUFS for that.)
+	function audioMeta () {
+		try {
+			var wv = wavesurfer ();
+			var buf = wv && wv.backend && wv.backend.buffer;
+			if (!buf) return null;
+			return { sampleRate: buf.sampleRate || null, channels: buf.numberOfChannels || null };
+		} catch ( _ ) { return null; }
+	}
+
 	// ---- multitrack helpers ------------------------------------------------
 	// The PKMultitrack instance (src/multitrack.js) exposes a *narrow* public API
 	// on the object stored at app.multitrack:
@@ -383,7 +397,7 @@
 	var VERBS = {
 
 		getProject: {
-			help: 'Return {loaded,duration,playhead,selection,multitrack} describing the current project state. When multitrack is ON, also returns tracks:[{id,name,mute,solo,vol,pan,rec,clips:[{id,name,start,in,out,len,fadeIn,fadeOut}]}].',
+			help: 'Return {loaded,duration,playhead,selection,multitrack} describing the current project state. Single-track also includes {sampleRate,channels} when audio is loaded. When multitrack is ON, also returns tracks:[{id,name,mute,solo,vol,pan,rec,clips:[{id,name,start,in,out,len,fadeIn,fadeOut}]}].',
 			run: function () {
 				var out = {
 					loaded:     loaded (),
@@ -392,7 +406,12 @@
 					selection:  selection (),
 					multitrack: multitrackOn ()
 				};
-				if (multitrackOn ()) out.tracks = mtTracks ();
+				if (multitrackOn ()) {
+					out.tracks = mtTracks ();
+				} else if (out.loaded) {
+					var meta = audioMeta ();
+					if (meta) { out.sampleRate = meta.sampleRate; out.channels = meta.channels; }
+				}
 				return out;
 			}
 		},
@@ -1455,15 +1474,44 @@
 					var before = measureWholeSafe ();
 					if (!before || typeof before.lufs !== 'number' || !isFinite (before.lufs))
 						throw new Error ('autoLevel: could not measure starting loudness');
-					return callVerb ('normalizeLUFS', { target: target })
+					var ceiling = (typeof args.ceiling === 'number' && !isNaN (args.ceiling)) ? args.ceiling : -1.0;
+					return callVerb ('normalizeLUFS', { target: target, ceiling: ceiling })
 						.then (function () { return delay (60); })
 						.then (function () {
 							var after = measureWholeSafe ();
+							// Honest reporting: "achieved" means we actually LANDED on the
+							// target (within tolerance), not merely that a number came back.
+							// Loudness normalization is capped by the true-peak ceiling — if
+							// the audio is peaky, it can't reach a high target without clipping,
+							// so it stops at the loudest SAFE level. Surface that explicitly so
+							// the caller never reads a near-miss as a clean success.
+							var TOL_DB = 0.5;
+							var achievedLUFS = (after && typeof after.lufs === 'number' && isFinite (after.lufs)) ? after.lufs : null;
+							var gapDb = (achievedLUFS !== null) ? (target - achievedLUFS) : null; // +ve = still too quiet
+							var achieved = (gapDb !== null) && Math.abs (gapDb) <= TOL_DB;
+							var note = null;
+							if (gapDb !== null && !achieved) {
+								var tp = (after && typeof after.truePeakDb === 'number') ? after.truePeakDb : null;
+								var ceilingLimited = (gapDb > 0) && (tp !== null) && (tp >= ceiling - 0.5);
+								if (ceilingLimited) {
+									note = 'Landed ' + gapDb.toFixed (2) + ' dB below the ' + target +
+										' LUFS target because it hit the ' + ceiling + ' dBTP true-peak ceiling (true peak now ' +
+										tp.toFixed (2) + ' dBTP). This is the loudest level reachable without clipping — raising it ' +
+										'further would distort. To get closer to target, compress/limit the peaks first, then re-level.';
+								} else if (gapDb > 0) {
+									note = 'Landed ' + gapDb.toFixed (2) + ' dB below the ' + target + ' LUFS target.';
+								} else {
+									note = 'Landed ' + Math.abs (gapDb).toFixed (2) + ' dB above the ' + target + ' LUFS target.';
+								}
+							}
 							return {
 								targetLUFS: target,
 								before: before,
 								after: after,
-								achieved: !!(after && typeof after.lufs === 'number'),
+								achievedLUFS: achievedLUFS,
+								gapDb: gapDb,
+								achieved: achieved,
+								note: note,
 								project: projectSnapshot ()
 							};
 						});
@@ -1784,6 +1832,55 @@
 					throw new Error ('regenerateSegment requires args.segment (the segment to regenerate)');
 				var n = (typeof args.n === 'number' && args.n >= 1) ? Math.floor (args.n) : 1;
 				return genStub ('regenerateSegment', { segment: args.segment, n: n });
+			}
+		},
+
+		batch: {
+			help: 'Run a SEQUENCE of verbs in ONE round-trip — each step runs in order and sees the result of the prior step. Args: {steps:[{verb, args}], stopOnError:true (default), snapshot:true (default — append a final getProject)}. (You may also pass a bare array of steps as the args.) Returns {steps, completed, ran:[{verb, ok, data|error}], stoppedAt?, project}. This is the fastest way to do a multi-step edit (load+select+delete+level+export in one call) — far fewer separate commands than firing each verb on its own. Cannot nest (a step cannot be "batch").',
+			run: function ( args ) {
+				args = args || {};
+				if (Array.isArray (args)) args = { steps: args };
+				var steps = args.steps || args.verbs;
+				if (!Array.isArray (steps) || !steps.length)
+					throw new Error ('batch requires args.steps: a non-empty array of {verb, args} (or pass a bare array)');
+				// Validate the WHOLE plan up front so a typo fails fast, before any mutation.
+				steps.forEach (function ( s, i ) {
+					if (!s || typeof s !== 'object' || typeof s.verb !== 'string' || !s.verb)
+						throw new Error ('batch: steps[' + i + '] must be an object {verb:string, args?:object}');
+					if (s.verb === 'batch')
+						throw new Error ('batch: steps[' + i + '] cannot be "batch" (no nesting)');
+					if (!VERBS[s.verb])
+						throw new Error ('batch: steps[' + i + '].verb is unknown: "' + s.verb + '"');
+				});
+				var stopOnError = !(args.stopOnError === false); // default true
+				var wantSnap    = !(args.snapshot === false);    // default true
+				var ran = [];
+				var stoppedAt = null;
+
+				var chain = Promise.resolve ();
+				steps.forEach (function ( s, i ) {
+					chain = chain.then (function () {
+						if (stoppedAt !== null) return; // a prior step failed under stopOnError
+						return callVerb (s.verb, s.args || {}).then (function ( data ) {
+							ran.push ({ verb: s.verb, ok: true, data: (data === undefined ? null : data) });
+						}, function ( err ) {
+							ran.push ({ verb: s.verb, ok: false, error: (err && err.message) ? err.message : String (err) });
+							if (stopOnError) stoppedAt = i;
+						});
+					});
+				});
+
+				var p = chain.then (function () {
+					var out = {
+						steps:     steps.length,
+						completed: ran.filter (function ( r ) { return r.ok; }).length,
+						ran:       ran
+					};
+					if (stoppedAt !== null) out.stoppedAt = stoppedAt;
+					if (wantSnap) out.project = projectSnapshot ();
+					return out;
+				});
+				return async (p);
 			}
 		},
 

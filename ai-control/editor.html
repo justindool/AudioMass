@@ -2,7 +2,18 @@
 <html lang="en">
 <head>
 	<title>AudioMass - AI Controllable Editor</title>
-	<link href="../src/ico.png" rel="shortcut icon">
+
+	<!-- CRITICAL: resolve all bare asset + Web Worker paths relative to upstream
+	     src/, exactly as src/index.html does. This wrapper lives in /ai-control/,
+	     so without a <base> the editor's `new Worker('lame.js')` (the mp3/wav/flac
+	     export encoders) would resolve to /ai-control/lame.js — a 404 — and export
+	     would silently never complete. The denoise wasm and any other bare-relative
+	     resource resolve correctly for the same reason. Upstream src/ stays pristine;
+	     only OUR wrapper carries this base. Our own control.js is loaded by ABSOLUTE
+	     path below so the <base> does not redirect it into src/. -->
+	<base href="../src/">
+
+	<link href="ico.png" rel="shortcut icon">
 	<meta charset="utf-8" />
 
 	<meta http-equiv="X-UA-Compatible" content="IE=edge" />
@@ -14,44 +25,46 @@
 	<meta name="apple-mobile-web-app-capable" content="yes">
 	<meta name="apple-mobile-web-app-status-bar-style" content="black">
 
-	<link rel="stylesheet" type="text/css" href="../src/main.css">
+	<link rel="stylesheet" type="text/css" href="main.css">
 </head>
 <body>
 	<div id="app"></div>
 
-	<!-- Mirrors src/index.html script load order, referenced via ../src so upstream stays pristine. -->
-	<script src="../src/dist/wavesurfer.js"></script>
-	<script src="../src/dist/plugin/wavesurfer.regions.js"></script>
-	<script src="../src/oneup.js"></script>
+	<!-- Mirrors src/index.html script load order. Paths are bare (like index.html);
+	     <base href="../src/"> resolves them against src/. welcome.js is intentionally
+	     NOT loaded: it only shows the GitHub/shortcuts modal, which we don't want
+	     blocking the AI-controlled editor. (Upstream file untouched.) -->
+	<script src="dist/wavesurfer.js"></script>
+	<script src="dist/plugin/wavesurfer.regions.js"></script>
+	<script src="oneup.js"></script>
 
-	<script src="../src/app.js"></script>
-	<script src="../src/keys.js"></script>
-	<script src="../src/markers.js"></script>
-	<script src="../src/contextmenu.js"></script>
-	<script src="../src/lufs.js"></script>
-	<script src="../src/ui-fx.js"></script>
-	<script src="../src/ui.js"></script>
-	<script src="../src/modal.js"></script>
-	<script src="../src/state.js"></script>
-	<script src="../src/engine.js"></script>
-	<script src="../src/actions.js"></script>
-	<script src="../src/drag.js"></script>
-	<script src="../src/recorder.js"></script>
+	<script src="app.js"></script>
+	<script src="keys.js"></script>
+	<script src="markers.js"></script>
+	<script src="contextmenu.js"></script>
+	<script src="lufs.js"></script>
+	<script src="ui-fx.js"></script>
+	<script src="ui.js"></script>
+	<script src="modal.js"></script>
+	<script src="state.js"></script>
+	<script src="engine.js"></script>
+	<script src="actions.js"></script>
+	<script src="drag.js"></script>
+	<script src="recorder.js"></script>
 
-	<!-- welcome.js intentionally NOT loaded: it only shows the GitHub/shortcuts modal,
-	     which we don't want blocking the AI-controlled editor. (Upstream file untouched.) -->
-	<script src="../src/fx-pg-eq.js"></script>
-	<script src="../src/fx-auto.js"></script>
-	<script src="../src/local.js"></script>
-	<script src="../src/id3.js"></script>
-	<script src="../src/lzma.js"></script>
-	<script src="../src/amss-format.js"></script>
-	<script src="../src/multitrack.js"></script>
+	<script src="fx-pg-eq.js"></script>
+	<script src="fx-auto.js"></script>
+	<script src="local.js"></script>
+	<script src="id3.js"></script>
+	<script src="lzma.js"></script>
+	<script src="amss-format.js"></script>
+	<script src="multitrack.js"></script>
 	<script>
 		var editor = PKAudioEditor.init ('app');
 	</script>
 
-	<!-- AI control client: polls for PKAudioEditor, dials the bridge, executes verbs. -->
-	<script src="control.js"></script>
+	<!-- AI control client. Lives in /ai-control/, so it MUST be an absolute path —
+	     a bare src would resolve against <base> (= src/) and 404. -->
+	<script src="/ai-control/control.js"></script>
 </body>
 </html>

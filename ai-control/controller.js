@@ -33,7 +33,39 @@
 const WebSocket = require('ws');
 
 const DEFAULT_URL = 'ws://127.0.0.1:8077';
-const DEFAULT_TIMEOUT_MS = 10000;
+const DEFAULT_TIMEOUT_MS = 15000;
+
+// Some verbs legitimately take much longer than a snappy command: they fetch +
+// decode audio, run a worker-based encode, or chain several of those. The editor
+// side already budgets real time for them (e.g. export waits up to 60s for the
+// encode), so the CLI's per-command timeout must be at least as generous or the
+// controller gives up while the editor is still working — exactly the failure a
+// cold operator hit on `export`. These are the defaults applied automatically
+// when the caller does NOT pass an explicit --timeout. (Generous on purpose:
+// a too-long wait only matters when something is genuinely broken, whereas a
+// too-short one breaks correct, in-progress work.)
+const VERB_TIMEOUTS = {
+  export:            75000,
+  loadAudio:         45000,
+  addClip:           45000,
+  measureLUFS:       30000,
+  autoLevel:         75000,
+  duckMusicUnderVoice: 30000,
+  trimDeadAir:       45000,
+  applyStandardFades: 45000,
+  compareVersions:   45000,
+  addVersionAsTrack: 90000,
+  swapVersion:       90000,
+  assembleSegments:  240000,
+  layInShow:         240000,
+  polishShow:        120000,
+  batch:             300000
+};
+
+/** The timeout to use for a verb when the caller didn't pass an explicit --timeout. */
+function timeoutForVerb(verb) {
+  return (verb && VERB_TIMEOUTS[verb]) || DEFAULT_TIMEOUT_MS;
+}
 
 /**
  * A controller-role client for the bridge.
@@ -233,7 +265,7 @@ function friendlyConnError(err, url) {
   return `WebSocket error connecting to ${url}: ${(err && err.message) || err}`;
 }
 
-module.exports = { Controller, DEFAULT_URL, DEFAULT_TIMEOUT_MS };
+module.exports = { Controller, DEFAULT_URL, DEFAULT_TIMEOUT_MS, VERB_TIMEOUTS, timeoutForVerb };
 
 /* ---------------------------------------------------------------------------
  * CLI
@@ -275,7 +307,7 @@ NOTES
 
 /** Minimal flag parser: pulls known --flags out, leaves positionals in order. */
 function parseArgv(argv) {
-  const out = { url: DEFAULT_URL, target: 'active', timeout: DEFAULT_TIMEOUT_MS, raw: false, watch: false, help: false, _: [] };
+  const out = { url: DEFAULT_URL, target: 'active', timeout: DEFAULT_TIMEOUT_MS, timeoutExplicit: false, raw: false, watch: false, help: false, _: [] };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     switch (a) {
@@ -284,7 +316,7 @@ function parseArgv(argv) {
       case '--raw': out.raw = true; break;
       case '--url': out.url = argv[++i]; break;
       case '--target': out.target = argv[++i]; break;
-      case '--timeout': out.timeout = parseInt(argv[++i], 10); break;
+      case '--timeout': out.timeout = parseInt(argv[++i], 10); out.timeoutExplicit = true; break;
       default:
         if (a && a.startsWith('--')) { out._unknown = a; }
         else out._.push(a);
@@ -308,7 +340,10 @@ async function cliMain() {
     process.exit(1);
   }
 
-  const ctrl = new Controller({ url: opts.url, name: 'cli', timeout: opts.timeout });
+  // Auto-scale the per-command timeout to the verb unless the caller forced one.
+  // (Watch mode has no verb; it doesn't issue timed commands.)
+  const effectiveTimeout = opts.timeoutExplicit ? opts.timeout : timeoutForVerb(opts._[0]);
+  const ctrl = new Controller({ url: opts.url, name: 'cli', timeout: effectiveTimeout });
 
   // Connect once. A clear message if the bridge isn't up.
   try {
