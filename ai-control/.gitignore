@@ -4,3 +4,4 @@ node_modules/
 # Local demo/test audio (not part of the control layer)
 *.mp3
 *.wav
+sessions/

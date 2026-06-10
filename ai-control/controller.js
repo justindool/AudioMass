@@ -59,7 +59,10 @@ const VERB_TIMEOUTS = {
   assembleSegments:  240000,
   layInShow:         240000,
   polishShow:        120000,
-  batch:             300000
+  batch:             300000,
+  layOutShow:        240000,
+  saveSession:       30000,
+  openSession:       240000
 };
 
 /** The timeout to use for a verb when the caller didn't pass an explicit --timeout. */
@@ -393,7 +396,76 @@ async function cliMain() {
     try {
       args = JSON.parse(opts._[1]);
     } catch (e) {
-      console.error(`Invalid jsonArgs (must be a JSON object): ${e.message}`);
+      // session commands take a bare name, not JSON
+      if (verb === 'saveSession' || verb === 'openSession') args = { name: opts._[1] };
+      else {
+        console.error(`Invalid jsonArgs (must be a JSON object): ${e.message}`);
+        ctrl.close();
+        process.exit(1);
+      }
+    }
+  }
+
+  // --- named sessions: save/restore the whole board state -------------------
+  // A session is a small JSON file (sessions/<name>.json) holding the board as a
+  // declarative layOutShow layout + track volumes. Restoring = newProject +
+  // layOutShow + volumes, so a saved show reopens exactly for review ("open
+  // Tuesday's show"). Clip URLs are derived from clip names by the staging
+  // convention: every loaded file lives in ai-control/ and keeps its filename.
+  if (verb === 'saveSession' || verb === 'openSession' || verb === 'listSessions') {
+    const fs = require('fs');
+    const path = require('path');
+    const dir = path.join(__dirname, 'sessions');
+    fs.mkdirSync(dir, { recursive: true });
+    try {
+      if (verb === 'listSessions') {
+        const out = fs.readdirSync(dir).filter((f) => f.endsWith('.json')).map((f) => {
+          const s = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8'));
+          const clips = (s.layout.tracks || []).reduce((n, t) => n + (t.clips || []).length, 0);
+          return { name: f.replace(/\.json$/, ''), savedAt: s.savedAt, tracks: (s.layout.tracks || []).length, clips };
+        });
+        console.log(pretty(out));
+      } else if (verb === 'saveSession') {
+        if (!args.name) throw new Error('usage: saveSession <name>');
+        const board = (await ctrl.send('getBoard')).data;
+        const layout = { tracks: board.tracks.map((t) => ({
+          name: t.name,
+          clips: t.clips.map((c) => {
+            const url = '/ai-control/' + c.name;
+            if (!fs.existsSync(path.join(__dirname, c.name)))
+              console.error(`# warning: source file not found for clip "${c.name}" — reopen will fail unless ${c.name} is in ai-control/`);
+            const clip = { url, at: Math.round(c.startSec * 1000) / 1000 };
+            if (c.fadeIn) clip.fadeIn = Math.round(c.fadeIn * 100) / 100;
+            if (c.fadeOut) clip.fadeOut = Math.round(c.fadeOut * 100) / 100;
+            return clip;
+          })
+        })) };
+        const volumes = {};
+        board.tracks.forEach((t) => { if (typeof t.vol === 'number' && Math.abs(t.vol - 1) > 0.001) volumes[t.name] = Math.round(t.vol * 10000) / 10000; });
+        const session = { savedAt: new Date().toISOString(), layout, volumes };
+        fs.writeFileSync(path.join(dir, args.name + '.json'), JSON.stringify(session, null, 2));
+        console.log(pretty({ saved: args.name, tracks: layout.tracks.length, clips: layout.tracks.reduce((n, t) => n + t.clips.length, 0) }));
+      } else { // openSession
+        if (!args.name) throw new Error('usage: openSession <name>');
+        const file = path.join(dir, args.name + '.json');
+        if (!fs.existsSync(file)) throw new Error(`no session named "${args.name}" (see listSessions)`);
+        const session = JSON.parse(fs.readFileSync(file, 'utf8'));
+        await ctrl.send('newProject').catch(() => {});
+        const fresh = await awaitReconnectThenGetProject(ctrl, opts.target);
+        if (!fresh) throw new Error('editor did not come back after newProject');
+        const res = await ctrl.send('layOutShow', { layout: session.layout });
+        for (const [trackName, vol] of Object.entries(session.volumes || {})) {
+          const board = (await ctrl.send('getBoard')).data;
+          const t = (board.tracks || []).find((x) => x.name === trackName);
+          if (t) await ctrl.send('setTrackVolume', { id: t.id, linear: vol });
+        }
+        const finalBoard = (await ctrl.send('getBoard')).data;
+        console.log(pretty({ opened: args.name, warnings: res.data.warnings, tracks: finalBoard.tracks.map((t) => ({ name: t.name, vol: t.vol, clips: t.clips.map((c) => ({ name: c.name, at: c.startSec, fadeIn: c.fadeIn, fadeOut: c.fadeOut })) })) }));
+      }
+      ctrl.close();
+      process.exit(0);
+    } catch (err) {
+      console.error(pretty({ ok: false, error: err.message }));
       ctrl.close();
       process.exit(1);
     }
